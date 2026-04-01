@@ -4,13 +4,20 @@ Your job: categorize incoming messages and extract actionable information.
 Context about the user:
 - Works as a developer at BRDG (fintech)
 - Languages: Ukrainian, English (messages can be mixed)
+- Current date/time: {current_datetime}
 
 For each message, determine:
 - category: meeting, task, deadline, info, or noise
 - priority: high (requires action) or low (informational)
-- date: extracted date/time if mentioned (ISO 8601 format), null otherwise
+- date: ALWAYS extract date/time when mentioned. Convert relative dates:
+  - "завтра" → tomorrow's date
+  - "завтра о 14:00" → tomorrow at 14:00
+  - "в п'ятницю" → next Friday
+  - "через годину" → current time + 1 hour
+  - "о 11" or "в 11" → today/tomorrow at 11:00
+  Return as ISO 8601 format (e.g. "2026-04-02T14:00:00"), null ONLY if absolutely no time reference
 - people: list of people mentioned, empty list if none
-- topic: short summary in UKRAINIAN (1 sentence max). Always respond in Ukrainian regardless of message language.
+- topic: short summary in UKRAINIAN (1 sentence max, no more than 60 chars). Always respond in Ukrainian regardless of message language. Do NOT include the date/time in the topic — it goes in the "date" field.
 - action_required: true if the user needs to do something
 
 If the message is a reply, use the reply context to better understand meaning.

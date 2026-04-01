@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -13,6 +14,12 @@ logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).parent.parent.parent.parent / "prompts" / "categorize.txt"
 
 
+def _get_system_prompt() -> str:
+    template = PROMPT_PATH.read_text() if PROMPT_PATH.exists() else "Categorize messages. Return JSON."
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return template.replace("{current_datetime}", now)
+
+
 class AIProvider(Protocol):
     async def categorize(self, messages: list[dict]) -> list[dict]: ...
 
@@ -23,7 +30,6 @@ class OpenAICompatibleProvider:
     def __init__(self, base_url: str, api_key: str, model: str):
         self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.model = model
-        self._system_prompt = PROMPT_PATH.read_text() if PROMPT_PATH.exists() else "Categorize messages. Return JSON."
 
     @retry(wait=wait_exponential(min=1, max=60), stop=stop_after_attempt(3))
     async def categorize(self, messages: list[dict]) -> list[dict]:
@@ -31,7 +37,7 @@ class OpenAICompatibleProvider:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": self._system_prompt},
+                {"role": "system", "content": _get_system_prompt()},
                 {"role": "user", "content": user_content},
             ],
             response_format={"type": "json_object"},
@@ -51,14 +57,13 @@ class GeminiProvider:
 
         self.client = genai.Client(api_key=api_key)
         self.model = model
-        self._system_prompt = PROMPT_PATH.read_text() if PROMPT_PATH.exists() else "Categorize messages. Return JSON."
 
     @retry(wait=wait_exponential(min=1, max=60), stop=stop_after_attempt(3))
     async def categorize(self, messages: list[dict]) -> list[dict]:
         user_content = json.dumps({"messages": messages}, ensure_ascii=False)
         response = self.client.models.generate_content(
             model=self.model,
-            contents=f"{self._system_prompt}\n\n{user_content}",
+            contents=f"{_get_system_prompt()}\n\n{user_content}",
             config={"response_mime_type": "application/json"},
         )
         text = response.text or "{}"

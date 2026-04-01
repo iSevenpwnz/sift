@@ -168,7 +168,7 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
 
 async def _create_task(msg: Message, ai_result: dict) -> Task | None:
     category = ai_result.get("category")
-    if category not in ("task", "deadline"):
+    if category not in ("task", "deadline", "meeting"):
         return None
 
     topic = ai_result.get("topic") or msg.content[:200]
