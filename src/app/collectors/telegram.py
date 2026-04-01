@@ -4,12 +4,39 @@ import logging
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
+from sqlalchemy import select
+
 from src.app.config import settings
+from src.app.db.models import UserSettings
+from src.app.db.session import async_session
 from src.app.processors.pipeline import persist_raw
 
 logger = logging.getLogger(__name__)
 
 _entity_cache: dict[int, str] = {}
+_ignored_chats: set[str] = set()
+_ignored_chats_loaded_at: float = 0
+
+
+async def _load_ignored_chats() -> set[str]:
+    """Load ignored chats from DB. Cache for 60 seconds."""
+    import time
+
+    global _ignored_chats, _ignored_chats_loaded_at
+    now = time.monotonic()
+    if now - _ignored_chats_loaded_at < 60:
+        return _ignored_chats
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserSettings.ignored_chats).where(
+                UserSettings.telegram_user_id == settings.telegram_owner_id
+            )
+        )
+        row = result.scalar_one_or_none()
+        _ignored_chats = set(str(c) for c in (row or []))
+        _ignored_chats_loaded_at = now
+    return _ignored_chats
 
 
 def create_userbot() -> TelegramClient:
@@ -28,6 +55,12 @@ def register_handlers(client: TelegramClient, queue: asyncio.Queue) -> None:
                 return
 
             chat_id = event.chat_id
+
+            # Check ignored chats
+            ignored = await _load_ignored_chats()
+            if str(chat_id) in ignored:
+                return
+
             chat_title = _entity_cache.get(chat_id)
             if chat_title is None:
                 chat = await event.get_chat()
