@@ -13,7 +13,7 @@ from src.app.bot.dispatcher import create_bot, create_dispatcher
 from src.app.collectors.telegram import create_userbot, register_handlers
 from src.app.config import settings
 from src.app.db.session import engine
-from src.app.processors.pipeline import message_processor, requeue_pending
+from src.app.processors.pipeline import message_processor, process_raw_backlog, requeue_pending
 from src.app.scheduler.jobs import daily_digest, retry_pending_ai
 
 logger = logging.getLogger(__name__)
@@ -62,10 +62,10 @@ async def lifespan(app: FastAPI):
     if pending_ids:
         logger.info(f"Re-queuing {len(pending_ids)} pending messages")
         for msg_id in pending_ids:
-            await queue.put({"_requeue_id": msg_id})
+            await queue.put(msg_id)
 
-    # Message processor
-    processor_task = asyncio.create_task(message_processor(queue))
+    # Message processor (with bot for notifications)
+    processor_task = asyncio.create_task(message_processor(queue, bot=bot))
 
     # Scheduler
     scheduler = AsyncIOScheduler()
@@ -78,7 +78,15 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         retry_pending_ai,
         IntervalTrigger(minutes=5),
+        args=[bot],
         id="retry_pending_ai",
+    )
+    scheduler.add_job(
+        process_raw_backlog,
+        IntervalTrigger(seconds=15),
+        args=[bot],
+        id="process_raw_backlog",
+        max_instances=3,
     )
     scheduler.start()
     logger.info("Scheduler started")

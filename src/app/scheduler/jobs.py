@@ -72,7 +72,7 @@ async def daily_digest(bot: Bot) -> None:
     await bot.send_message(chat_id=settings.telegram_owner_id, text="\n".join(lines))
 
 
-async def retry_pending_ai() -> None:
+async def retry_pending_ai(bot: Bot) -> None:
     """Retry messages stuck in pending_ai status."""
     async with async_session() as session:
         result = await session.execute(
@@ -82,4 +82,4 @@ async def retry_pending_ai() -> None:
 
     if ids:
         logger.info(f"Retrying {len(ids)} pending AI messages")
-        await process_batch(ids)
+        await process_batch(ids, bot=bot)

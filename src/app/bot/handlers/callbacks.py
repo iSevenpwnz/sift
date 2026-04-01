@@ -20,7 +20,7 @@ async def task_done(callback: CallbackQuery) -> None:
             await session.commit()
             await callback.answer("Done!")
             if callback.message:
-                await callback.message.edit_text(f"~{task.title}~ — done", parse_mode="MarkdownV2")
+                await callback.message.edit_text(f"✅ <s>{task.title}</s> — done", parse_mode="HTML")
         else:
             await callback.answer("Task not found")
 
