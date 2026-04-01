@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.app.db.models import Message
@@ -33,7 +33,7 @@ async def persist_raw(message_data: dict) -> int | None:
             )
             .on_conflict_do_update(
                 index_elements=["source_id"],
-                set_={"content": message_data["content"], "updated_at": Message.updated_at.default.arg},
+                set_={"content": message_data["content"], "updated_at": func.now()},
             )
             .returning(Message.id)
         )
@@ -131,9 +131,14 @@ async def message_processor(queue: asyncio.Queue) -> None:
             # Collect up to BATCH_SIZE messages or wait BATCH_TIMEOUT
             try:
                 msg_data = await asyncio.wait_for(queue.get(), timeout=BATCH_TIMEOUT)
-                msg_id = await persist_raw(msg_data)
-                if msg_id:
-                    batch.append(msg_id)
+
+                # Re-queued messages from DB already have an ID
+                if "_requeue_id" in msg_data:
+                    batch.append(msg_data["_requeue_id"])
+                else:
+                    msg_id = await persist_raw(msg_data)
+                    if msg_id:
+                        batch.append(msg_id)
             except asyncio.TimeoutError:
                 pass  # Timeout reached, process what we have
 
