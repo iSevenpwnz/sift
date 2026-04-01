@@ -217,7 +217,16 @@ async def _create_task(msg: Message, ai_result: dict) -> Task | None:
     if ai_result.get("date"):
         due_date = _parse_ai_date(ai_result["date"])
 
+    # Dedup: don't create if similar active task exists
     async with async_session() as session:
+        existing = await session.execute(
+            select(Task)
+            .where(Task.is_done.is_(False))
+            .where(func.lower(Task.title) == topic.strip().lower())
+        )
+        if existing.scalar_one_or_none():
+            return None
+
         task = Task(message_id=msg.id, title=topic, due_date=due_date)
         session.add(task)
         await session.commit()
@@ -225,8 +234,42 @@ async def _create_task(msg: Message, ai_result: dict) -> Task | None:
         return task
 
 
+async def _is_quiet_or_muted() -> bool:
+    """Check if quiet hours are active or bot is muted."""
+    from src.app.db.models import UserSettings
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserSettings).where(UserSettings.telegram_user_id == settings.telegram_owner_id)
+        )
+        us = result.scalar_one_or_none()
+        if not us:
+            return False
+
+        # Check mute
+        muted_until = (us.quiet_hours or {}).get("muted_until")
+        if muted_until:
+            mute_dt = datetime.fromisoformat(muted_until)
+            if datetime.now(USER_TZ) < mute_dt:
+                return True
+
+        # Check quiet hours
+        start = (us.quiet_hours or {}).get("start")
+        end = (us.quiet_hours or {}).get("end")
+        if start and end:
+            now_time = datetime.now(USER_TZ).strftime("%H:%M")
+            # Handle overnight ranges (e.g. 22:00-08:00)
+            if start > end:
+                if now_time >= start or now_time < end:
+                    return True
+            else:
+                if start <= now_time < end:
+                    return True
+
+    return False
+
+
 async def _notify(bot: Bot, msg: Message, ai_result: dict, task: Task | None = None) -> None:
-    """Send notification. Checks status to prevent duplicates."""
+    """Send notification. Respects quiet hours and mute."""
     category = ai_result.get("category", "info")
     priority = ai_result.get("priority", "low")
 
@@ -234,6 +277,9 @@ async def _notify(bot: Bot, msg: Message, ai_result: dict, task: Task | None = N
         return
     if category == "info" and priority == "low":
         return
+
+    # Quiet hours / mute — still mark as processed but don't send
+    quiet = await _is_quiet_or_muted()
 
     # Atomic check-and-set to prevent duplicate notifications
     async with async_session() as session:
@@ -245,7 +291,12 @@ async def _notify(bot: Bot, msg: Message, ai_result: dict, task: Task | None = N
         )
         msg_obj = fresh.scalar_one_or_none()
         if not msg_obj:
-            return  # Already notified
+            return
+
+        if quiet:
+            msg_obj.status = "processed"  # Will appear in /summary but no push
+            await session.commit()
+            return
 
         msg_obj.status = "notified"
         msg_obj.notified_at = func.now()

@@ -27,7 +27,9 @@ async def setup_bot_commands(bot) -> None:
             BotCommand(command="summary", description="Дайджест повідомлень"),
             BotCommand(command="tasks", description="Активні таски"),
             BotCommand(command="week", description="План на тиждень"),
-            BotCommand(command="all", description="Всі повідомлення"),
+            BotCommand(command="mute", description="Вимкнути нотифікації (1h)"),
+            BotCommand(command="unmute", description="Увімкнути нотифікації"),
+            BotCommand(command="status", description="Статус системи"),
             BotCommand(command="settings", description="Налаштування"),
         ],
         scope=BotCommandScopeDefault(),
@@ -226,3 +228,101 @@ async def cmd_all(message: Message) -> None:
         text += content_preview
 
         await message.answer(text, parse_mode="HTML")
+
+
+# ── Mute ────────────────────────────────────────────────────
+
+@router.message(Command("mute"))
+async def cmd_mute(message: Message) -> None:
+    """Mute notifications. Usage: /mute 2 (hours, default 1)."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from src.app.db.models import UserSettings
+
+    args = message.text.split()
+    hours = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
+
+    tz = ZoneInfo("Europe/Kyiv")
+    until = datetime.now(tz) + timedelta(hours=hours)
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserSettings).where(UserSettings.telegram_user_id == message.from_user.id)
+        )
+        us = result.scalar_one_or_none()
+        if us:
+            qh = dict(us.quiet_hours or {})
+            qh["muted_until"] = until.isoformat()
+            us.quiet_hours = qh
+            await session.commit()
+
+    until_str = until.strftime("%H:%M")
+    await message.answer(
+        f"🔇 <b>Нотифікації вимкнено до {until_str}</b>\n"
+        f"Повідомлення збиратимуться і будуть в /summary.\n"
+        f"Щоб увімкнути: /unmute",
+        parse_mode="HTML",
+        reply_markup=main_keyboard(),
+    )
+
+
+@router.message(Command("unmute"))
+async def cmd_unmute(message: Message) -> None:
+    from src.app.db.models import UserSettings
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserSettings).where(UserSettings.telegram_user_id == message.from_user.id)
+        )
+        us = result.scalar_one_or_none()
+        if us:
+            qh = dict(us.quiet_hours or {})
+            qh.pop("muted_until", None)
+            us.quiet_hours = qh
+            await session.commit()
+
+    await message.answer("🔔 <b>Нотифікації увімкнено!</b>", parse_mode="HTML", reply_markup=main_keyboard())
+
+
+# ── Status ──────────────────────────────────────────────────
+
+@router.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    from src.app.db.models import UserSettings
+
+    async with async_session() as session:
+        # Counts
+        total = (await session.execute(select(func.count()).select_from(DbMessage))).scalar_one()
+        today_count = (await session.execute(
+            select(func.count()).select_from(DbMessage).where(func.date(DbMessage.created_at) == func.current_date())
+        )).scalar_one()
+        raw_count = (await session.execute(
+            select(func.count()).select_from(DbMessage).where(DbMessage.status == "raw")
+        )).scalar_one()
+        tasks_count = (await session.execute(
+            select(func.count()).select_from(Task).where(Task.is_done.is_(False))
+        )).scalar_one()
+
+        # Settings
+        result = await session.execute(
+            select(UserSettings).where(UserSettings.telegram_user_id == message.from_user.id)
+        )
+        us = result.scalar_one_or_none()
+
+    monitored = len(us.monitored_chats or []) if us else 0
+    ignored = len(us.ignored_chats or []) if us else 0
+
+    muted_until = (us.quiet_hours or {}).get("muted_until") if us else None
+    mute_str = "🔇 вимкнено" if muted_until else "🔔 увімкнено"
+
+    lines = [
+        "📊 <b>Статус Sift</b>\n",
+        f"💬 Повідомлень: {total} всього, {today_count} сьогодні",
+        f"⏳ В черзі: {raw_count}",
+        f"📋 Активних тасків: {tasks_count}",
+        f"\n🔔 Моніторимо чатів: {monitored}",
+        f"🔇 Ігноруємо чатів: {ignored}",
+        f"📢 Нотифікації: {mute_str}",
+    ]
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_keyboard())
