@@ -59,9 +59,17 @@ async def cmd_summary(message: Message) -> None:
     from zoneinfo import ZoneInfo
     from src.app.scheduler.jobs import build_digest
 
+    loading = await message.answer("⏳ Генерую дайджест...")
     today = dt.now(ZoneInfo("Europe/Kyiv")).date()
-    text, keyboard = await build_digest(today)
-    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    content, keyboard = await build_digest(today)
+
+    await loading.delete()
+    if isinstance(content, list):
+        for i, part in enumerate(content):
+            is_last = i == len(content) - 1
+            await message.answer(text=part, parse_mode="HTML", reply_markup=keyboard if is_last else None)
+    else:
+        await message.answer(text=content, parse_mode="HTML", reply_markup=keyboard)
 
 
 # ── Tasks (slash + button) ──────────────────────────────────

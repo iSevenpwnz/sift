@@ -225,6 +225,10 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
     if bot and notification_buffer:
         await _flush_notifications(bot, notification_buffer)
 
+    # Invalidate digest cache when new messages processed
+    from src.app.scheduler.jobs import _digest_cache
+    _digest_cache.clear()
+
 
 async def _create_task(msg: Message, ai_result: dict) -> Task | None:
     category = ai_result.get("category")

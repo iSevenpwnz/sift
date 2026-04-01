@@ -118,7 +118,7 @@ async def task_snooze(callback: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data and c.data.startswith("digest:"))
 async def digest_navigate(callback: CallbackQuery) -> None:
     from datetime import date as date_type
-    from src.app.scheduler.jobs import build_digest
+    from src.app.scheduler.jobs import build_digest, _send_digest
 
     date_str = callback.data.split(":", 1)[1]
     try:
@@ -127,9 +127,21 @@ async def digest_navigate(callback: CallbackQuery) -> None:
         await callback.answer("Невірна дата")
         return
 
-    text, keyboard = await build_digest(target)
+    # Answer immediately to prevent timeout
+    await callback.answer("⏳")
+
     try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        await callback.message.edit_text("⏳ Генерую дайджест...")
     except Exception:
-        pass  # MessageNotModified
-    await callback.answer()
+        pass
+
+    content, keyboard = await build_digest(target)
+
+    try:
+        if isinstance(content, list):
+            await callback.message.delete()
+            await _send_digest(callback.bot, content, keyboard)
+        else:
+            await callback.message.edit_text(text=content, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        pass
