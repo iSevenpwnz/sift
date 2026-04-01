@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import time
 
+from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-
-from sqlalchemy import select
 
 from src.app.config import settings
 from src.app.db.models import UserSettings
@@ -14,29 +16,43 @@ from src.app.processors.pipeline import persist_raw
 logger = logging.getLogger(__name__)
 
 _entity_cache: dict[int, str] = {}
-_ignored_chats: set[str] = set()
-_ignored_chats_loaded_at: float = 0
+
+# Chat approval state: "monitored" | "ignored" | None (unknown)
+_chat_decisions: dict[str, str] = {}
+_chat_decisions_loaded_at: float = 0
+_pending_approval: set[str] = set()  # chats we already asked about
 
 
-async def _load_ignored_chats() -> set[str]:
-    """Load ignored chats from DB. Cache for 60 seconds."""
-    import time
-
-    global _ignored_chats, _ignored_chats_loaded_at
+async def _load_chat_decisions() -> dict[str, str]:
+    """Load monitored/ignored chats from DB. Cache for 60s."""
+    global _chat_decisions, _chat_decisions_loaded_at
     now = time.monotonic()
-    if now - _ignored_chats_loaded_at < 60:
-        return _ignored_chats
+    if now - _chat_decisions_loaded_at < 60:
+        return _chat_decisions
 
     async with async_session() as session:
         result = await session.execute(
-            select(UserSettings.ignored_chats).where(
-                UserSettings.telegram_user_id == settings.telegram_owner_id
-            )
+            select(UserSettings).where(UserSettings.telegram_user_id == settings.telegram_owner_id)
         )
-        row = result.scalar_one_or_none()
-        _ignored_chats = set(str(c) for c in (row or []))
-        _ignored_chats_loaded_at = now
-    return _ignored_chats
+        us = result.scalar_one_or_none()
+
+    decisions = {}
+    if us:
+        for chat_id in (us.monitored_chats or []):
+            decisions[str(chat_id)] = "monitored"
+        for chat_id in (us.ignored_chats or []):
+            decisions[str(chat_id)] = "ignored"
+
+    _chat_decisions = decisions
+    _chat_decisions_loaded_at = now
+    return decisions
+
+
+def _approval_keyboard(chat_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔔 Моніторити", callback_data=f"approve:{chat_id}"),
+        InlineKeyboardButton(text="🔇 Ігнорувати", callback_data=f"reject:{chat_id}"),
+    ]])
 
 
 def create_userbot() -> TelegramClient:
@@ -47,26 +63,56 @@ def create_userbot() -> TelegramClient:
     )
 
 
-def register_handlers(client: TelegramClient, queue: asyncio.Queue) -> None:
+def register_handlers(client: TelegramClient, queue: asyncio.Queue, bot: Bot | None = None) -> None:
     @client.on(events.NewMessage)
     async def on_new_message(event: events.NewMessage.Event) -> None:
         try:
+            # Skip Saved Messages
             if event.out and event.is_private:
                 return
 
             chat_id = event.chat_id
+            chat_id_str = str(chat_id)
+            is_private = event.is_private  # DM
 
-            # Check ignored chats
-            ignored = await _load_ignored_chats()
-            if str(chat_id) in ignored:
-                return
+            # DM — always process
+            if not is_private:
+                decisions = await _load_chat_decisions()
+                decision = decisions.get(chat_id_str)
 
+                if decision == "ignored":
+                    return
+
+                if decision is None:
+                    # Unknown chat — ask owner
+                    if chat_id_str not in _pending_approval and bot:
+                        _pending_approval.add(chat_id_str)
+                        chat = await event.get_chat()
+                        chat_title = getattr(chat, "title", getattr(chat, "first_name", "Unknown"))
+                        _entity_cache[chat_id] = chat_title
+
+                        try:
+                            await bot.send_message(
+                                chat_id=settings.telegram_owner_id,
+                                text=f"🆕 <b>Новий чат виявлено:</b>\n<i>{chat_title}</i>",
+                                parse_mode="HTML",
+                                reply_markup=_approval_keyboard(chat_id_str),
+                                disable_notification=True,
+                            )
+                        except Exception:
+                            logger.exception("Failed to send approval request")
+                    return  # Don't process until approved
+
+                # decision == "monitored" — continue processing
+
+            # Resolve chat title
             chat_title = _entity_cache.get(chat_id)
             if chat_title is None:
                 chat = await event.get_chat()
                 chat_title = getattr(chat, "title", getattr(chat, "first_name", "Unknown"))
                 _entity_cache[chat_id] = chat_title
 
+            # Reply context
             reply_text = None
             if event.reply_to_msg_id:
                 try:
@@ -75,6 +121,7 @@ def register_handlers(client: TelegramClient, queue: asyncio.Queue) -> None:
                 except Exception:
                     pass
 
+            # Content type
             content_type = "text"
             content = event.text or ""
 
@@ -108,7 +155,6 @@ def register_handlers(client: TelegramClient, queue: asyncio.Queue) -> None:
                 "raw_metadata": {"chat_id": chat_id, "message_id": event.id},
             }
 
-            # Persist to DB immediately (write-ahead)
             msg_id = await persist_raw(msg_data)
             if msg_id:
                 await queue.put(msg_id)
@@ -123,8 +169,14 @@ def register_handlers(client: TelegramClient, queue: asyncio.Queue) -> None:
                 return
 
             chat_id = event.chat_id
-            chat_title = _entity_cache.get(chat_id, "Unknown")
+            chat_id_str = str(chat_id)
 
+            if not event.is_private:
+                decisions = await _load_chat_decisions()
+                if decisions.get(chat_id_str) != "monitored":
+                    return
+
+            chat_title = _entity_cache.get(chat_id, "Unknown")
             content = event.text or ""
             if not content.strip():
                 return

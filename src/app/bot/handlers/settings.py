@@ -50,23 +50,32 @@ async def get_or_create_settings(user_id: int) -> UserSettings:
 async def get_known_chats(user_id: int) -> list[dict]:
     """Get unique chats from messages DB — real chats the user has."""
     from src.app.db.models import Message
+    from sqlalchemy import distinct, func, text
 
     async with async_session() as session:
+        # Use DISTINCT ON to get one row per chat
         result = await session.execute(
-            select(Message.raw_metadata["chat_id"].as_string(), Message.source_chat)
+            select(
+                func.distinct(Message.source_chat).label("chat_name"),
+            )
             .where(Message.source == "telegram")
             .where(Message.source_chat.is_not(None))
-            .group_by(Message.raw_metadata["chat_id"].as_string(), Message.source_chat)
-            .order_by(Message.source_chat)
+            .where(Message.source_chat != "Unknown")
         )
-        rows = result.all()
+        chat_names = [row[0] for row in result.all()]
 
-    chats = []
-    seen = set()
-    for chat_id_str, chat_name in rows:
-        if chat_id_str not in seen and chat_name:
-            seen.add(chat_id_str)
-            chats.append({"id": chat_id_str, "name": chat_name})
+        # Get chat_id for each chat name from raw_metadata
+        chats = []
+        for name in sorted(chat_names):
+            row = await session.execute(
+                select(Message.raw_metadata)
+                .where(Message.source_chat == name)
+                .limit(1)
+            )
+            meta = row.scalar_one_or_none()
+            if meta and "chat_id" in meta:
+                chats.append({"id": str(meta["chat_id"]), "name": name})
+
     return chats
 
 

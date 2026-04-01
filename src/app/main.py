@@ -42,18 +42,17 @@ async def lifespan(app: FastAPI):
     # Message queue
     queue: asyncio.Queue = asyncio.Queue()
 
+    # aiogram bot (create first — needed by Telethon for approval messages)
+    bot = create_bot()
+    dp = create_dispatcher()
+
     # Telethon userbot
     userbot = create_userbot()
-    register_handlers(userbot, queue)
+    register_handlers(userbot, queue, bot=bot)
     await userbot.connect()
     if not await userbot.is_user_authorized():
         logger.error("Telethon session not authorized. Run scripts/generate_session.py locally first.")
         raise RuntimeError("Telethon not authorized")
-    logger.info("Telethon connected")
-
-    # aiogram bot
-    bot = create_bot()
-    dp = create_dispatcher()
     polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
     logger.info("aiogram bot started")
 

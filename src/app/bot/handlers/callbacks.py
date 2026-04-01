@@ -2,11 +2,74 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Router
 from aiogram.types import CallbackQuery
+from sqlalchemy import select
 
-from src.app.db.models import Task
+from src.app.db.models import Task, UserSettings
 from src.app.db.session import async_session
+from src.app.config import settings
 
 router = Router()
+
+
+# ── Chat approval (from Telethon collector) ─────────────────
+
+@router.callback_query(lambda c: c.data and c.data.startswith("approve:"))
+async def approve_chat(callback: CallbackQuery) -> None:
+    chat_id = callback.data.split(":", 1)[1]
+    await _set_chat_decision(chat_id, "monitored")
+
+    # Clear pending cache so collector starts processing
+    from src.app.collectors.telegram import _pending_approval, _chat_decisions, _chat_decisions_loaded_at
+    _pending_approval.discard(chat_id)
+    _chat_decisions[chat_id] = "monitored"
+
+    await callback.answer("🔔 Моніторимо!")
+    if callback.message:
+        original_text = callback.message.text or ""
+        await callback.message.edit_text(f"✅ {original_text}\n\n<b>→ Моніторимо</b>", parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("reject:"))
+async def reject_chat(callback: CallbackQuery) -> None:
+    chat_id = callback.data.split(":", 1)[1]
+    await _set_chat_decision(chat_id, "ignored")
+
+    from src.app.collectors.telegram import _pending_approval, _chat_decisions
+    _pending_approval.discard(chat_id)
+    _chat_decisions[chat_id] = "ignored"
+
+    await callback.answer("🔇 Ігноруємо!")
+    if callback.message:
+        original_text = callback.message.text or ""
+        await callback.message.edit_text(f"🔇 {original_text}\n\n<b>→ Ігноруємо</b>", parse_mode="HTML")
+
+
+async def _set_chat_decision(chat_id: str, decision: str) -> None:
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserSettings).where(UserSettings.telegram_user_id == settings.telegram_owner_id)
+        )
+        us = result.scalar_one_or_none()
+        if not us:
+            us = UserSettings(telegram_user_id=settings.telegram_owner_id)
+            session.add(us)
+            await session.flush()
+
+        monitored = list(us.monitored_chats or [])
+        ignored = list(us.ignored_chats or [])
+
+        # Remove from both lists first
+        monitored = [c for c in monitored if str(c) != chat_id]
+        ignored = [c for c in ignored if str(c) != chat_id]
+
+        if decision == "monitored":
+            monitored.append(chat_id)
+        else:
+            ignored.append(chat_id)
+
+        us.monitored_chats = monitored
+        us.ignored_chats = ignored
+        await session.commit()
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("task_done:"))
