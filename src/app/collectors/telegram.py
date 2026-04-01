@@ -75,6 +75,11 @@ def register_handlers(client: TelegramClient, queue: asyncio.Queue, bot: Bot | N
             chat_id_str = str(chat_id)
             is_private = event.is_private  # DM
 
+            # Skip messages from the bot itself
+            bot_id = int(settings.telegram_bot_token.split(":")[0])
+            if chat_id == bot_id:
+                return
+
             # DM — always process
             if not is_private:
                 decisions = await _load_chat_decisions()

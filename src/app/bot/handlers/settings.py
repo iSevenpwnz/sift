@@ -169,6 +169,7 @@ def digest_keyboard(current_hour: str) -> InlineKeyboardMarkup:
 # ── Entry point ─────────────────────────────────────────────
 
 @router.message(Command("settings"))
+@router.message(F.text == "⚙️ Налаштування")
 async def cmd_settings(message: Message, state: FSMContext) -> None:
     us = await get_or_create_settings(message.from_user.id)
     await state.set_state(Settings.main)
