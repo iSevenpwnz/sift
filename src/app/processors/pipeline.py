@@ -1,9 +1,12 @@
 import asyncio
 import logging
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -67,6 +70,18 @@ CATEGORY_ICONS = {
     "deadline": "🔴",
     "info": "💡",
 }
+
+
+@dataclass
+class NotificationItem:
+    msg: Message
+    ai_result: dict
+    task: Task | None
+    icon: str
+    topic: str
+    sender: str
+    time_str: str
+    priority: str
 
 
 async def persist_raw(message_data: dict) -> int | None:
@@ -174,8 +189,9 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
                 await session.commit()
             return
 
-    # Save results + create tasks + notify
+    # Save results + create tasks + collect notifications
     result_map = {r.get("id"): r for r in results if "id" in r}
+    notification_buffer: list[NotificationItem] = []
 
     for msg in to_ai:
         ai_result = result_map.get(msg.id, {})
@@ -199,12 +215,15 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
                 msg_obj.extracted_date = _parse_ai_date(ai_result["date"])
             await session.commit()
 
-        # Create task if needed
         task = await _create_task(msg, ai_result)
 
-        # Notify (only once — status check inside)
         if bot:
-            await _notify(bot, msg, ai_result, task)
+            item = await _prepare_notification(msg, ai_result, task)
+            if item:
+                notification_buffer.append(item)
+
+    if bot and notification_buffer:
+        await _flush_notifications(bot, notification_buffer)
 
 
 async def _create_task(msg: Message, ai_result: dict) -> Task | None:
@@ -268,17 +287,15 @@ async def _is_quiet_or_muted() -> bool:
     return False
 
 
-async def _notify(bot: Bot, msg: Message, ai_result: dict, task: Task | None = None) -> None:
-    """Send notification. Respects quiet hours and mute."""
+async def _prepare_notification(msg: Message, ai_result: dict, task: Task | None = None) -> NotificationItem | None:
     category = ai_result.get("category", "info")
     priority = ai_result.get("priority", "low")
 
     if category == "noise":
-        return
+        return None
     if category == "info" and priority == "low":
-        return
+        return None
 
-    # Quiet hours / mute — still mark as processed but don't send
     quiet = await _is_quiet_or_muted()
 
     # Atomic check-and-set to prevent duplicate notifications
@@ -291,12 +308,12 @@ async def _notify(bot: Bot, msg: Message, ai_result: dict, task: Task | None = N
         )
         msg_obj = fresh.scalar_one_or_none()
         if not msg_obj:
-            return
+            return None
 
         if quiet:
-            msg_obj.status = "processed"  # Will appear in /summary but no push
+            msg_obj.status = "processed"
             await session.commit()
-            return
+            return None
 
         msg_obj.status = "notified"
         msg_obj.notified_at = func.now()
@@ -304,32 +321,81 @@ async def _notify(bot: Bot, msg: Message, ai_result: dict, task: Task | None = N
 
     icon = CATEGORY_ICONS.get(category, "💬")
     topic = ai_result.get("topic") or msg.content[:100]
-    chat = msg.source_chat or "—"
     sender = msg.sender or ""
+    time_str = msg.created_at.strftime("%H:%M") if msg.created_at else ""
 
-    text = f"{icon} <b>{topic}</b>\n"
-    text += f"<i>{chat} — {sender}</i>\n"
+    return NotificationItem(
+        msg=msg, ai_result=ai_result, task=task,
+        icon=icon, topic=topic, sender=sender,
+        time_str=time_str, priority=priority,
+    )
 
-    if ai_result.get("date"):
-        text += f"📆 {_format_date(ai_result['date'])}\n"
-    if ai_result.get("people"):
-        text += f"👥 {', '.join(ai_result['people'])}\n"
 
-    preview = msg.content[:300]
-    if len(msg.content) > 300:
+def _format_single(item: NotificationItem) -> str:
+    chat = item.msg.source_chat or "—"
+    text = f"{item.icon} <b>{item.topic}</b>\n"
+    text += f"<i>{chat} — {item.sender}</i>\n"
+    if item.ai_result.get("date"):
+        text += f"📆 {_format_date(item.ai_result['date'])}\n"
+    if item.ai_result.get("people"):
+        text += f"👥 {', '.join(item.ai_result['people'])}\n"
+    preview = item.msg.content[:300]
+    if len(item.msg.content) > 300:
         preview += "..."
     text += f"\n{preview}"
+    return text
 
-    try:
-        await bot.send_message(
-            chat_id=settings.telegram_owner_id,
-            text=text,
-            parse_mode="HTML",
-            disable_notification=(priority != "high"),
-            reply_markup=task_keyboard(task.id) if task else None,
-        )
-    except Exception:
-        logger.exception(f"Failed to send notification for message {msg.id}")
+
+def _format_grouped(chat_name: str, items: list[NotificationItem]) -> str:
+    count = len(items)
+    noun = "повідомлення" if 2 <= count <= 4 else "повідомлень"
+    text = f"<b>{chat_name}</b> • {count} {noun}\n"
+    for item in items:
+        text += f"\n{item.icon} {item.topic}\n"
+        text += f"    <i>{item.sender} • {item.time_str}</i>\n"
+    return text
+
+
+async def _flush_notifications(bot: Bot, buffer: list[NotificationItem]) -> None:
+    groups: dict[str, list[NotificationItem]] = defaultdict(list)
+    for item in buffer:
+        key = item.msg.source_chat or "—"
+        groups[key].append(item)
+
+    for chat_name, items in groups.items():
+        has_task = any(i.task for i in items)
+        is_high = any(i.priority == "high" for i in items)
+
+        if len(items) == 1:
+            item = items[0]
+            text = _format_single(item)
+            reply_markup = task_keyboard(item.task.id) if item.task else None
+        else:
+            text = _format_grouped(chat_name, items)
+            if has_task:
+                task_items = [i for i in items if i.task]
+                buttons = []
+                for ti in task_items:
+                    short = ti.topic[:20] + ("..." if len(ti.topic) > 20 else "")
+                    buttons.append([
+                        InlineKeyboardButton(text=f"✅ {short}", callback_data=f"task_done:{ti.task.id}"),
+                        InlineKeyboardButton(text="⏰ 1h", callback_data=f"task_snooze:{ti.task.id}:1"),
+                    ])
+                reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+            else:
+                reply_markup = None
+
+        try:
+            await bot.send_message(
+                chat_id=settings.telegram_owner_id,
+                text=text,
+                parse_mode="HTML",
+                disable_notification=(not is_high),
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            msg_ids = [i.msg.id for i in items]
+            logger.exception(f"Failed to send grouped notification for messages {msg_ids}")
 
 
 # ── Main processor loop ──────────────────────────────────────

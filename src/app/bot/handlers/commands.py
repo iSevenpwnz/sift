@@ -27,6 +27,7 @@ async def setup_bot_commands(bot) -> None:
             BotCommand(command="summary", description="Дайджест повідомлень"),
             BotCommand(command="tasks", description="Активні таски"),
             BotCommand(command="week", description="План на тиждень"),
+            BotCommand(command="history", description="Історія за дату"),
             BotCommand(command="mute", description="Вимкнути нотифікації (1h)"),
             BotCommand(command="unmute", description="Увімкнути нотифікації"),
             BotCommand(command="status", description="Статус системи"),
@@ -228,6 +229,84 @@ async def cmd_all(message: Message) -> None:
         text += content_preview
 
         await message.answer(text, parse_mode="HTML")
+
+
+# ── History ─────────────────────────────────────────────────
+
+@router.message(Command("history"))
+async def cmd_history(message: Message) -> None:
+    """Show digest for a specific date. Usage: /history 31.03 or /history yesterday."""
+    from datetime import datetime as dt, timedelta
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Europe/Kyiv")
+    args = message.text.split(maxsplit=1)
+    target_date = None
+
+    if len(args) > 1:
+        arg = args[1].strip().lower()
+        if arg in ("вчора", "yesterday"):
+            target_date = (dt.now(tz) - timedelta(days=1)).date()
+        else:
+            for fmt in ("%d.%m", "%d.%m.%Y", "%Y-%m-%d"):
+                try:
+                    parsed = dt.strptime(arg, fmt)
+                    if fmt == "%d.%m":
+                        parsed = parsed.replace(year=dt.now().year)
+                    target_date = parsed.date()
+                    break
+                except ValueError:
+                    continue
+
+    if not target_date:
+        await message.answer(
+            "📅 <b>Використання:</b>\n"
+            "<code>/history вчора</code>\n"
+            "<code>/history 31.03</code>\n"
+            "<code>/history 25.03.2026</code>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(DbMessage)
+            .where(func.date(DbMessage.created_at) == target_date)
+            .where(DbMessage.category.is_not(None))
+            .where(DbMessage.category != "noise")
+            .order_by(DbMessage.created_at.desc())
+            .limit(20)
+        )
+        messages = list(result.scalars().all())
+
+        result = await session.execute(
+            select(func.count()).select_from(DbMessage)
+            .where(func.date(DbMessage.created_at) == target_date)
+        )
+        total = result.scalar_one()
+
+    date_str = target_date.strftime("%d.%m.%Y")
+
+    if not messages:
+        await message.answer(
+            f"📅 <b>{date_str}</b> — нічого важливого ({total} повідомлень).",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    lines = [f"📅 <b>Історія за {date_str}</b>  •  {len(messages)} важливих з {total}\n"]
+
+    for msg in messages:
+        icon = CATEGORY_ICONS.get(msg.category, "💬")
+        topic = msg.extracted_topic or msg.content[:80]
+        chat = msg.source_chat or "—"
+        time_str = msg.created_at.strftime("%H:%M") if msg.created_at else ""
+        lines.append(f"{icon} <b>{topic}</b>")
+        lines.append(f"      <i>{chat} • {time_str}</i>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_keyboard())
 
 
 # ── Mute ────────────────────────────────────────────────────

@@ -1,13 +1,14 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
-from sqlalchemy import func, select, distinct
+from sqlalchemy import delete, func, select, distinct
 
 from src.app.db.models import Message, Task
 from src.app.db.session import async_session
 from src.app.config import settings
+from src.app.bot.keyboards import task_keyboard
 from src.app.processors.pipeline import process_messages
 
 logger = logging.getLogger(__name__)
@@ -146,3 +147,56 @@ async def retry_pending_ai(bot: Bot) -> None:
             messages = list(result.scalars().all())
         if messages:
             await process_messages(messages, bot)
+
+
+async def check_snoozed_tasks(bot: Bot) -> None:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Task).where(
+                Task.is_done.is_(False),
+                Task.snoozed_until.is_not(None),
+                Task.snoozed_until <= func.now(),
+            )
+        )
+        tasks = list(result.scalars().all())
+
+        for task in tasks:
+            try:
+                await bot.send_message(
+                    chat_id=settings.telegram_owner_id,
+                    text=f"⏰ <b>Нагадування:</b> {task.title}",
+                    parse_mode="HTML",
+                    reply_markup=task_keyboard(task.id),
+                )
+            except Exception:
+                logger.exception(f"Failed to send snooze reminder for task {task.id}")
+                continue
+            task.snoozed_until = None
+
+        if tasks:
+            await session.commit()
+            logger.info(f"Sent {len(tasks)} snooze reminders")
+
+
+async def cleanup_old_data(bot: Bot) -> None:
+    cutoff = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=30)
+    async with async_session() as session:
+        msg_result = await session.execute(
+            delete(Message).where(
+                Message.status.in_(["processed", "notified"]),
+                Message.created_at < cutoff,
+            )
+        )
+        messages_deleted = msg_result.rowcount
+
+        task_result = await session.execute(
+            delete(Task).where(
+                Task.is_done.is_(True),
+                Task.done_at < cutoff,
+            )
+        )
+        tasks_deleted = task_result.rowcount
+
+        await session.commit()
+
+    logger.info(f"Cleanup: deleted {messages_deleted} messages, {tasks_deleted} tasks")
