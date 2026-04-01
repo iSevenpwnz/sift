@@ -55,54 +55,13 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("summary"))
 @router.message(F.text == "📊 Дайджест")
 async def cmd_summary(message: Message) -> None:
-    async with async_session() as session:
-        today = func.current_date()
+    from datetime import datetime as dt
+    from zoneinfo import ZoneInfo
+    from src.app.scheduler.jobs import build_digest
 
-        result = await session.execute(
-            select(DbMessage)
-            .where(func.date(DbMessage.created_at) == today)
-            .where(DbMessage.category.is_not(None))
-            .where(DbMessage.category != "noise")
-            .order_by(DbMessage.created_at.desc())
-            .limit(15)
-        )
-        important = list(result.scalars().all())
-
-        result = await session.execute(
-            select(func.count()).select_from(DbMessage)
-            .where(func.date(DbMessage.created_at) == today)
-            .where(DbMessage.status.in_(["processed", "notified"]))
-        )
-        total = result.scalar_one()
-
-        result = await session.execute(
-            select(func.count()).select_from(DbMessage)
-            .where(func.date(DbMessage.created_at) == today)
-            .where(DbMessage.category == "noise")
-        )
-        noise_count = result.scalar_one()
-
-    if not total:
-        await message.answer("Сьогодні ще нічого не оброблено.", reply_markup=main_keyboard())
-        return
-
-    lines = [f"📊 <b>Дайджест</b>  •  {total} оброблено, {noise_count} шум\n"]
-
-    if not important:
-        lines.append("Нічого важливого не знайдено.")
-    else:
-        for msg in important:
-            icon = CATEGORY_ICONS.get(msg.category, "💬")
-            topic = msg.extracted_topic or msg.content[:80]
-            chat = msg.source_chat or "—"
-            sender = msg.sender or ""
-            priority_mark = " ❗️" if msg.priority == "high" else ""
-            time_str = msg.created_at.strftime("%H:%M") if msg.created_at else ""
-
-            lines.append(f"{icon}{priority_mark} <b>{topic}</b>")
-            lines.append(f"      <i>{chat} • {sender} • {time_str}</i>")
-
-    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_keyboard())
+    today = dt.now(ZoneInfo("Europe/Kyiv")).date()
+    text, keyboard = await build_digest(today)
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 # ── Tasks (slash + button) ──────────────────────────────────

@@ -1,17 +1,22 @@
 import logging
-from datetime import datetime, timedelta
+from collections import defaultdict
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
-from sqlalchemy import delete, func, select, distinct
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import delete, func, select
 
 from src.app.db.models import Message, Task
 from src.app.db.session import async_session
 from src.app.config import settings
 from src.app.bot.keyboards import task_keyboard
 from src.app.processors.pipeline import process_messages
+from src.app.processors.ai_provider import get_primary_provider, get_fallback_provider
 
 logger = logging.getLogger(__name__)
+
+USER_TZ = ZoneInfo("Europe/Kyiv")
 
 CATEGORY_ICONS = {
     "meeting": "📅",
@@ -20,61 +25,104 @@ CATEGORY_ICONS = {
     "info": "💡",
 }
 
-USER_TZ = ZoneInfo("Europe/Kyiv")
+
+async def _summarize_groups(groups: dict[str, list[Message]]) -> dict[str, str]:
+    """Ask AI to summarize each chat group based on full message content."""
+    items = []
+    for chat_name, msgs in groups.items():
+        # Give AI the actual messages, not just topics
+        messages_text = []
+        for m in msgs[:15]:  # max 15 per chat
+            sender = m.sender or ""
+            text = m.content[:300]
+            if sender:
+                messages_text.append(f"{sender}: {text}")
+            else:
+                messages_text.append(text)
+        items.append({
+            "chat": chat_name,
+            "count": len(msgs),
+            "messages": messages_text,
+        })
+
+    if not items:
+        return {}
+
+    import json
+    from pathlib import Path
+
+    prompt_path = Path(__file__).parent.parent.parent.parent / "prompts" / "digest_summary.txt"
+    system_prompt = prompt_path.read_text() if prompt_path.exists() else "Summarize each chat in Ukrainian. Return JSON."
+
+    user_content = json.dumps(items, ensure_ascii=False)
+
+    try:
+        provider = get_primary_provider()
+        response = await provider.client.chat.completions.create(
+            model=provider.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+        text = response.choices[0].message.content or "{}"
+        parsed = json.loads(text)
+        return parsed.get("summaries", {})
+    except Exception:
+        logger.warning("Failed to generate digest summaries, using fallback")
+        # Fallback: just concatenate topics
+        result = {}
+        for chat_name, msgs in groups.items():
+            topics = [m.extracted_topic or m.content[:40] for m in msgs[:5]]
+            result[chat_name] = "; ".join(t for t in topics if t)
+        return result
 
 
-async def daily_digest(bot: Bot) -> None:
-    """Send daily digest to owner."""
+def _digest_nav_keyboard(target_date: date) -> InlineKeyboardMarkup:
+    """Navigation buttons for digest: ◀️ Prev day / Next day ▶️"""
+    prev_date = target_date - timedelta(days=1)
+    next_date = target_date + timedelta(days=1)
+    today = datetime.now(USER_TZ).date()
+
+    buttons = [InlineKeyboardButton(text=f"◀️ {prev_date.strftime('%d.%m')}", callback_data=f"digest:{prev_date.isoformat()}")]
+    if target_date < today:
+        buttons.append(InlineKeyboardButton(text=f"{next_date.strftime('%d.%m')} ▶️", callback_data=f"digest:{next_date.isoformat()}"))
+
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+async def build_digest(target_date: date) -> tuple[str, InlineKeyboardMarkup]:
+    """Build digest text for a specific date. Returns (text, keyboard)."""
     async with async_session() as session:
-        today = func.current_date()
+        # All non-noise messages for this date, grouped by chat
+        result = await session.execute(
+            select(Message)
+            .where(func.date(Message.created_at) == target_date)
+            .where(Message.category.is_not(None))
+            .where(Message.category != "noise")
+            .where(Message.source_chat.is_not(None))
+            .order_by(Message.created_at.desc())
+        )
+        all_msgs = list(result.scalars().all())
 
         # Stats
         result = await session.execute(
-            select(Message.category, func.count())
-            .where(func.date(Message.created_at) == today)
+            select(func.count()).select_from(Message)
+            .where(func.date(Message.created_at) == target_date)
             .where(Message.category.is_not(None))
-            .group_by(Message.category)
         )
-        stats = dict(result.all())
+        total = result.scalar_one()
 
-        # Important messages — deduplicate by topic
         result = await session.execute(
-            select(Message)
-            .where(func.date(Message.created_at) == today)
-            .where(Message.category.in_(["meeting", "task", "deadline"]))
-            .where(Message.source_chat != "Sift Hub")
-            .where(Message.source_chat != "Unknown")
-            .order_by(Message.created_at.desc())
-            .limit(20)
+            select(func.count()).select_from(Message)
+            .where(func.date(Message.created_at) == target_date)
+            .where(Message.category == "noise")
         )
-        all_important = list(result.scalars().all())
+        noise = result.scalar_one()
 
-        # Deduplicate by topic (fuzzy — first 30 chars)
-        seen_topics = set()
-        important = []
-        for msg in all_important:
-            topic = (msg.extracted_topic or msg.content[:60]).strip().lower()
-            key = topic[:30]  # fuzzy dedup by prefix
-            if key not in seen_topics:
-                seen_topics.add(key)
-                important.append(msg)
-            if len(important) >= 8:
-                break
-
-        # Missed during quiet hours
-        result = await session.execute(
-            select(Message)
-            .where(func.date(Message.created_at) == today)
-            .where(Message.priority == "high")
-            .where(Message.status == "processed")
-            .where(Message.source_chat != "Sift Hub")
-            .where(Message.source_chat != "Unknown")
-            .order_by(Message.created_at.desc())
-            .limit(5)
-        )
-        missed = list(result.scalars().all())
-
-        # Active tasks (not done, not snoozed)
+        # Active tasks
         result = await session.execute(
             select(Task)
             .where(Task.is_done.is_(False))
@@ -84,51 +132,74 @@ async def daily_digest(bot: Bot) -> None:
         )
         tasks = list(result.scalars().all())
 
-    total = sum(stats.values())
-    if not total and not tasks:
-        return
+    if not all_msgs and not tasks:
+        date_str = target_date.strftime("%d.%m")
+        return f"📊 <b>Дайджест за {date_str}</b>\n\nНічого важливого.", _digest_nav_keyboard(target_date)
 
-    now = datetime.now(USER_TZ)
-    lines = [f"☀️ <b>Доброго ранку! Дайджест за {now.strftime('%d.%m')}</b>\n"]
+    # Group by chat
+    chat_groups: dict[str, list[Message]] = defaultdict(list)
+    for msg in all_msgs:
+        chat_groups[msg.source_chat or "Інше"].append(msg)
 
-    noise = stats.get("noise", 0)
+    # Get AI summaries
+    summaries = await _summarize_groups(chat_groups)
+
+    # Build text
+    date_str = target_date.strftime("%d.%m")
     useful = total - noise
-    lines.append(f"💬 {total} повідомлень  •  {useful} корисних  •  {noise} шум\n")
+    lines = [f"📊 <b>Дайджест за {date_str}</b>  •  {useful} корисних, {noise} шум\n"]
 
-    if missed:
-        lines.append("🔕 <b>Пропущено (тихі години):</b>")
-        for msg in missed:
-            icon = CATEGORY_ICONS.get(msg.category, "💬")
-            topic = msg.extracted_topic or msg.content[:60]
-            lines.append(f"  {icon} {topic}")
+    for chat_name, msgs in sorted(chat_groups.items(), key=lambda x: -len(x[1])):
+        count = len(msgs)
+        noun = "повідомлення" if 2 <= count <= 4 else "повідомлень" if count >= 5 else "повідомлення"
+
+        # Chat header
+        lines.append(f"💬 <b>{chat_name}</b> — {count} {noun}")
+
+        # AI summary as blockquote
+        summary = summaries.get(chat_name, "")
+        if summary:
+            lines.append(f"<blockquote>{summary}</blockquote>")
+
+        # Meetings/tasks/deadlines from this chat
+        for msg in msgs:
+            if msg.category in ("meeting", "deadline", "task"):
+                icon = CATEGORY_ICONS.get(msg.category, "📌")
+                topic = msg.extracted_topic or msg.content[:60]
+                date_info = ""
+                if msg.extracted_date:
+                    date_info = f" — {msg.extracted_date.strftime('%d.%m %H:%M')}"
+                lines.append(f"  {icon} {topic}{date_info}")
+
         lines.append("")
 
-    if important:
-        lines.append("📌 <b>Важливе:</b>")
-        for msg in important:
-            icon = CATEGORY_ICONS.get(msg.category, "💬")
-            topic = msg.extracted_topic or msg.content[:60]
-            chat = msg.source_chat or ""
-            time_str = msg.created_at.strftime("%H:%M") if msg.created_at else ""
-            lines.append(f"  {icon} {topic}")
-            lines.append(f"      <i>{chat} • {time_str}</i>")
-        lines.append("")
-
+    # Tasks
     if tasks:
         lines.append(f"📋 <b>Активні таски ({len(tasks)}):</b>")
         for task in tasks:
             due = f" • до {task.due_date.strftime('%d.%m %H:%M')}" if task.due_date else ""
             lines.append(f"  • {task.title}{due}")
-        lines.append("")
     else:
-        lines.append("📋 Активних тасків: 0\n")
+        lines.append("📋 Активних тасків: 0")
 
-    lines.append("Гарного дня!")
+    text = "\n".join(lines)
 
+    # Trim if too long (Telegram limit 4096)
+    if len(text) > 4000:
+        text = text[:3990] + "\n\n<i>...обрізано</i>"
+
+    return text, _digest_nav_keyboard(target_date)
+
+
+async def daily_digest(bot: Bot) -> None:
+    """Send daily digest to owner."""
+    today = datetime.now(USER_TZ).date()
+    text, keyboard = await build_digest(today)
     await bot.send_message(
         chat_id=settings.telegram_owner_id,
-        text="\n".join(lines),
+        text=text,
         parse_mode="HTML",
+        reply_markup=keyboard,
     )
 
 
@@ -150,6 +221,7 @@ async def retry_pending_ai(bot: Bot) -> None:
 
 
 async def check_snoozed_tasks(bot: Bot) -> None:
+    """Re-notify about tasks when snooze expires."""
     async with async_session() as session:
         result = await session.execute(
             select(Task).where(
@@ -179,6 +251,7 @@ async def check_snoozed_tasks(bot: Bot) -> None:
 
 
 async def cleanup_old_data(bot: Bot) -> None:
+    """Delete processed messages and done tasks older than 30 days."""
     cutoff = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=30)
     async with async_session() as session:
         msg_result = await session.execute(

@@ -111,3 +111,25 @@ async def task_snooze(callback: CallbackQuery) -> None:
                 )
         else:
             await callback.answer("Task not found")
+
+
+# ── Digest navigation ───────────────────────────────────────
+
+@router.callback_query(lambda c: c.data and c.data.startswith("digest:"))
+async def digest_navigate(callback: CallbackQuery) -> None:
+    from datetime import date as date_type
+    from src.app.scheduler.jobs import build_digest
+
+    date_str = callback.data.split(":", 1)[1]
+    try:
+        target = date_type.fromisoformat(date_str)
+    except ValueError:
+        await callback.answer("Невірна дата")
+        return
+
+    text, keyboard = await build_digest(target)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        pass  # MessageNotModified
+    await callback.answer()
