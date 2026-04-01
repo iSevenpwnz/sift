@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from src.app.db.models import Message, Task
 from src.app.db.session import async_session
 from src.app.config import settings
-from src.app.processors.pipeline import process_batch
+from src.app.processors.pipeline import claim_raw_messages, process_messages
 
 logger = logging.getLogger(__name__)
 
@@ -82,4 +82,9 @@ async def retry_pending_ai(bot: Bot) -> None:
 
     if ids:
         logger.info(f"Retrying {len(ids)} pending AI messages")
-        await process_batch(ids, bot=bot)
+        async with async_session() as session:
+            from src.app.db.models import Message as MsgModel
+            result = await session.execute(select(MsgModel).where(MsgModel.id.in_(ids)))
+            messages = list(result.scalars().all())
+        if messages:
+            await process_messages(messages, bot)
