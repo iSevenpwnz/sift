@@ -83,7 +83,9 @@ async def task_done(callback: CallbackQuery) -> None:
             await session.commit()
             await callback.answer("Done!")
             if callback.message:
-                await callback.message.edit_text(f"✅ <s>{task.title}</s> — done", parse_mode="HTML")
+                await callback.message.edit_text(
+                    f"✅ <s>{task.title}</s> — done", parse_mode="HTML", reply_markup=None
+                )
         else:
             await callback.answer("Task not found")
 
@@ -99,6 +101,13 @@ async def task_snooze(callback: CallbackQuery) -> None:
         if task:
             task.snoozed_until = datetime.now(timezone.utc) + timedelta(hours=hours)
             await session.commit()
-            await callback.answer(f"Snoozed for {hours}h")
+            until = task.snoozed_until.strftime("%H:%M")
+            await callback.answer(f"⏰ Нагадаю о {until}")
+            if callback.message:
+                await callback.message.edit_text(
+                    f"⏰ <b>{task.title}</b>\n<i>Відкладено до {until}</i>",
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
         else:
             await callback.answer("Task not found")

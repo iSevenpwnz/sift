@@ -173,6 +173,11 @@ def register_handlers(client: TelegramClient, queue: asyncio.Queue, bot: Bot | N
             if event.out and event.is_private:
                 return
 
+            # Skip bot's own edits
+            bot_id = int(settings.telegram_bot_token.split(":")[0])
+            if event.chat_id == bot_id:
+                return
+
             chat_id = event.chat_id
             chat_id_str = str(chat_id)
 

@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from sqlalchemy import func, select, update
@@ -16,6 +17,49 @@ from src.app.config import settings
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 10
+
+USER_TZ = ZoneInfo("Europe/Kyiv")
+DAYS_UK = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
+
+
+def _parse_ai_date(iso_str: str) -> datetime | None:
+    """Parse AI date string. Treat naive datetimes as user timezone (Kyiv)."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=USER_TZ)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _format_date(iso_str: str) -> str:
+    """'2026-04-02T15:00:00' → 'завтра о 15:00' or 'середа, 02.04 о 15:00'."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=USER_TZ)
+        now = datetime.now(dt.tzinfo)
+        today = now.date()
+        target = dt.date()
+        delta = (target - today).days
+
+        time_str = dt.strftime("%H:%M")
+
+        if delta == 0:
+            return f"сьогодні о {time_str}"
+        elif delta == 1:
+            return f"завтра о {time_str}"
+        elif delta == -1:
+            return f"вчора о {time_str}"
+        elif 2 <= delta <= 6:
+            day_name = DAYS_UK[dt.weekday()]
+            return f"{day_name}, {dt.strftime('%d.%m')} о {time_str}"
+        else:
+            return f"{dt.strftime('%d.%m.%Y')} о {time_str}"
+    except (ValueError, TypeError):
+        return iso_str
+
 
 CATEGORY_ICONS = {
     "meeting": "📅",
@@ -152,10 +196,7 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
             msg_obj.status = "processed"
 
             if ai_result.get("date"):
-                try:
-                    msg_obj.extracted_date = datetime.fromisoformat(ai_result["date"])
-                except (ValueError, TypeError):
-                    pass
+                msg_obj.extracted_date = _parse_ai_date(ai_result["date"])
             await session.commit()
 
         # Create task if needed
@@ -174,10 +215,7 @@ async def _create_task(msg: Message, ai_result: dict) -> Task | None:
     topic = ai_result.get("topic") or msg.content[:200]
     due_date = None
     if ai_result.get("date"):
-        try:
-            due_date = datetime.fromisoformat(ai_result["date"])
-        except (ValueError, TypeError):
-            pass
+        due_date = _parse_ai_date(ai_result["date"])
 
     async with async_session() as session:
         task = Task(message_id=msg.id, title=topic, due_date=due_date)
@@ -222,7 +260,7 @@ async def _notify(bot: Bot, msg: Message, ai_result: dict, task: Task | None = N
     text += f"<i>{chat} — {sender}</i>\n"
 
     if ai_result.get("date"):
-        text += f"📆 {ai_result['date']}\n"
+        text += f"📆 {_format_date(ai_result['date'])}\n"
     if ai_result.get("people"):
         text += f"👥 {', '.join(ai_result['people'])}\n"
 
