@@ -3,7 +3,7 @@ services:
     build: .
     env_file: .env
     ports:
-      - "8000:8000"
+      - "8100:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -17,7 +17,7 @@ services:
       POSTGRES_USER: sift
       POSTGRES_PASSWORD: localdev
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
