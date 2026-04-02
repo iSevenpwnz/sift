@@ -136,16 +136,17 @@ async def update_chat_summaries(messages: list[Message], result_map: dict) -> No
     """Incrementally update daily chat summaries for non-noise messages."""
     try:
         today = date.today()
-        non_noise = [
+        # Build summaries for ALL messages (including noise channels — they're still useful for digest)
+        categorized = [
             m for m in messages
-            if result_map.get(m.id, {}).get("category") not in (None, "noise")
+            if result_map.get(m.id, {}).get("category") is not None
         ]
-        logger.info(f"update_chat_summaries: {len(messages)} msgs, {len(non_noise)} non-noise")
-        if not non_noise:
+        logger.info(f"update_chat_summaries: {len(messages)} msgs, {len(categorized)} categorized")
+        if not categorized:
             return
 
         groups: dict[str, list[Message]] = defaultdict(list)
-        for msg in non_noise:
+        for msg in categorized:
             chat = msg.source_chat or "Unknown"
             groups[chat].append(msg)
 
@@ -183,7 +184,7 @@ async def update_chat_summaries(messages: list[Message], result_map: dict) -> No
                         max_tokens=200,
                         temperature=0.3,
                     ),
-                    timeout=25,
+                    timeout=40,
                 )
                 summary_text = response.choices[0].message.content or ""
 

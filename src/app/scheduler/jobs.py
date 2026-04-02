@@ -129,6 +129,7 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
         us = us_result.scalar_one_or_none()
         ignored_ids = set(str(c) for c in (us.ignored_chats if us else []))
 
+        # Non-noise messages (DMs, groups)
         result = await session.execute(
             select(Message)
             .where(func.date(Message.created_at) == target_date)
@@ -138,8 +139,21 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
             .where(Message.source_chat != "Unknown")
             .order_by(Message.created_at.desc())
         )
-        # Filter out ignored chats
-        all_msgs = [
+        non_noise_msgs = [
+            m for m in result.scalars().all()
+            if str((m.raw_metadata or {}).get("chat_id", "")) not in ignored_ids
+        ]
+
+        # ALL messages including noise (for channels section)
+        result = await session.execute(
+            select(Message)
+            .where(func.date(Message.created_at) == target_date)
+            .where(Message.category.is_not(None))
+            .where(Message.source_chat.is_not(None))
+            .where(Message.source_chat != "Unknown")
+            .order_by(Message.created_at.desc())
+        )
+        all_msgs_with_noise = [
             m for m in result.scalars().all()
             if str((m.raw_metadata or {}).get("chat_id", "")) not in ignored_ids
         ]
@@ -172,32 +186,32 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
         )
         done_msg_ids = set(result.scalars().all())
 
-    if not all_msgs and not tasks:
+    if not non_noise_msgs and not all_msgs_with_noise and not tasks:
         date_str = target_date.strftime("%d.%m")
         result = (f"📊 Дайджест за {date_str}\n\nНічого важливого.", _digest_nav_keyboard(target_date))
         _digest_cache[cache_key] = (result[0], result[1], time.monotonic())
         return result
 
-    e = html_mod.escape  # shorthand
+    e = html_mod.escape
 
-    # Group by chat
-    chat_groups: dict[str, list[Message]] = defaultdict(list)
-    for msg in all_msgs:
-        chat_groups[msg.source_chat or "Інше"].append(msg)
+    # Group ALL messages (including noise) — classify by chat type
+    dm_chats: dict[str, list[Message]] = defaultdict(list)
+    group_chats: dict[str, list[Message]] = defaultdict(list)
+    channel_chats: dict[str, list[Message]] = defaultdict(list)
 
-    # Classify: DM / group / channel
-    dm_chats = {}
-    group_chats = {}
-    channel_chats = {}
-    for chat_name, msgs in chat_groups.items():
-        meta = msgs[0].raw_metadata or {}
+    for msg in all_msgs_with_noise:
+        meta = msg.raw_metadata or {}
         chat_id = meta.get("chat_id", 0)
+        chat_name = msg.source_chat or "Інше"
+
         if isinstance(chat_id, int) and chat_id > 0:
-            dm_chats[chat_name] = msgs
-        elif all(not m.sender or m.sender == "Unknown" for m in msgs[:5]):
-            channel_chats[chat_name] = msgs
+            dm_chats[chat_name].append(msg)
+        elif not msg.sender or msg.sender == "Unknown":
+            channel_chats[chat_name].append(msg)
         else:
-            group_chats[chat_name] = msgs
+            group_chats[chat_name].append(msg)
+
+    chat_groups = {**dm_chats, **group_chats, **channel_chats}
 
     # Load pre-built summaries from DB, fallback to AI generation
     async with async_session() as session:
@@ -223,8 +237,7 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
             return name
         return name[:max_len - 1] + "…"
 
-    def _render_chat(chat_name: str, msgs: list):
-        count = len(msgs)
+    def _render_chat(chat_name: str, msgs: list, is_channel: bool = False):
         summary = summaries.get(chat_name, "")
         short = _short_name(chat_name)
 
@@ -247,17 +260,18 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
                 actions.append(f"{ic} {e(topic)}{date_info}")
         actions = actions[:3]
 
-        lines.append(f"\n💬 <b>{e(short)}</b> — {count} {_noun(count)}")
-
-        # Everything in one expandable blockquote
+        # Build blockquote content first to count items
         block_parts = []
+        items_shown = 0
+
         if summary:
             block_parts.append(e(summary))
+            items_shown = len(msgs)
         else:
             # No AI summary — build from topics with links
             seen_t = set()
             topic_lines = []
-            for msg in msgs[:8]:
+            for msg in msgs[:10]:
                 t = msg.extracted_topic or msg.content[:50]
                 key = t[:20].lower()
                 if key in seen_t:
@@ -268,11 +282,19 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
                     topic_lines.append(f'• <a href="{link}">{e(t)}</a>')
                 else:
                     topic_lines.append(f"• {e(t)}")
+            items_shown = len(topic_lines)
             if topic_lines:
                 block_parts.append("\n".join(topic_lines))
 
         if actions:
             block_parts.append("\n".join(actions))
+
+        # Header with correct count
+        if is_channel and items_shown < len(msgs):
+            count_text = f"{items_shown} новин з {len(msgs)}"
+        else:
+            count_text = f"{len(msgs)} {_noun(len(msgs))}"
+        lines.append(f"\n💬 <b>{e(short)}</b> — {count_text}")
 
         if block_parts:
             block_text = "\n\n".join(block_parts)
@@ -302,7 +324,7 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
         single_channels = [(cn, ms) for cn, ms in sorted_channels if len(ms) == 1]
 
         for cn, ms in main_channels[:5]:
-            _render_chat(cn, ms)
+            _render_chat(cn, ms, is_channel=True)
 
         # Singles — compact list in one expandable block, with links
         if single_channels:

@@ -148,12 +148,15 @@ def register_handlers(client: TelegramClient, queue: asyncio.Queue, bot: Bot | N
             sender_name = getattr(sender, "first_name", "") or ""
             if hasattr(sender, "last_name") and sender.last_name:
                 sender_name = f"{sender_name} {sender.last_name}"
+            # Fallback for DMs: use chat title as sender name
+            if not sender_name.strip() and is_private:
+                sender_name = chat_title
 
             msg_data = {
                 "source": "telegram",
                 "source_id": f"tg_{event.id}_{chat_id}",
                 "source_chat": chat_title,
-                "sender": sender_name.strip() or "Unknown",
+                "sender": sender_name.strip() or chat_title or "Unknown",
                 "content": content,
                 "content_type": content_type,
                 "reply_to_text": reply_text,
