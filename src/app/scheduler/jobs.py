@@ -194,22 +194,29 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
 
     e = html_mod.escape
 
-    # Group ALL messages (including noise) — classify by chat type
-    dm_chats: dict[str, list[Message]] = defaultdict(list)
-    group_chats: dict[str, list[Message]] = defaultdict(list)
-    channel_chats: dict[str, list[Message]] = defaultdict(list)
-
+    # Group ALL messages by chat first, then classify chat type
+    all_by_chat: dict[str, list[Message]] = defaultdict(list)
     for msg in all_msgs_with_noise:
-        meta = msg.raw_metadata or {}
+        all_by_chat[msg.source_chat or "Інше"].append(msg)
+
+    dm_chats: dict[str, list[Message]] = {}
+    group_chats: dict[str, list[Message]] = {}
+    channel_chats: dict[str, list[Message]] = {}
+
+    for chat_name, msgs in all_by_chat.items():
+        # Check first message metadata for chat type
+        meta = msgs[0].raw_metadata or {}
         chat_id = meta.get("chat_id", 0)
-        chat_name = msg.source_chat or "Інше"
 
         if isinstance(chat_id, int) and chat_id > 0:
-            dm_chats[chat_name].append(msg)
-        elif not msg.sender or msg.sender == "Unknown":
-            channel_chats[chat_name].append(msg)
+            dm_chats[chat_name] = msgs
         else:
-            group_chats[chat_name].append(msg)
+            # Channel vs group: if >50% messages have no real sender → channel
+            no_sender = sum(1 for m in msgs if not m.sender or m.sender == "Unknown")
+            if no_sender > len(msgs) * 0.5:
+                channel_chats[chat_name] = msgs
+            else:
+                group_chats[chat_name] = msgs
 
     chat_groups = {**dm_chats, **group_chats, **channel_chats}
 
@@ -264,7 +271,8 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
         block_parts = []
         items_shown = 0
 
-        if summary:
+        if summary and not is_channel:
+            # AI summary for DMs and groups
             block_parts.append(e(summary))
             items_shown = len(msgs)
         else:

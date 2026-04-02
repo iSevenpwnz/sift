@@ -383,19 +383,19 @@ async def cmd_status(message: Message) -> None:
 
 # ── Catchup ─────────────────────────────────────────────────
 
-CATCHUP_BATCH = 5  # chats per AI call
-CATCHUP_MAX_CHATS = 30  # max chats to process
-
 @router.message(Command("catchup"))
 async def cmd_catchup(message: Message) -> None:
-    """Scan all unread messages and create a batched digest."""
+    """Streaming catchup: sends results as they're ready."""
     import html as html_mod
     import json
     from aiogram.types import LinkPreviewOptions
     from src.app.processors.ai_provider import get_primary_provider
 
     e = html_mod.escape
-    loading = await message.answer("🔄 Сканую непрочитані повідомлення...")
+    no_preview = LinkPreviewOptions(is_disabled=True)
+    BATCH = 8  # chats per AI call
+
+    loading = await message.answer("🔄 Сканую непрочитані...")
 
     try:
         import src.app.shared as shared
@@ -404,138 +404,147 @@ async def cmd_catchup(message: Message) -> None:
             await loading.edit_text("❌ Telethon не підключений.")
             return
 
-        # Get all dialogs with unread messages
-        dialogs = []
-        async for dialog in client.iter_dialogs():
-            if dialog.unread_count > 0 and dialog.unread_count < 1000:
-                dialogs.append(dialog)
+        # ── Step 1: Collect all unread dialogs ──
+        dm_dialogs = []
+        group_dialogs = []
+        channel_dialogs = []
 
-        if not dialogs:
-            await loading.edit_text("✅ Немає непрочитаних повідомлень!")
+        async for dialog in client.iter_dialogs():
+            if dialog.unread_count <= 0:
+                continue
+            if dialog.is_user:
+                dm_dialogs.append(dialog)
+            elif dialog.is_group:
+                group_dialogs.append(dialog)
+            elif dialog.is_channel:
+                channel_dialogs.append(dialog)
+
+        all_dialogs = dm_dialogs + group_dialogs + channel_dialogs
+        total_unread = sum(d.unread_count for d in all_dialogs)
+
+        if not all_dialogs:
+            await loading.edit_text("✅ Немає непрочитаних!")
             return
 
-        total_unread = sum(d.unread_count for d in dialogs)
-        sorted_dialogs = sorted(dialogs, key=lambda d: -d.unread_count)[:CATCHUP_MAX_CHATS]
-
         await loading.edit_text(
-            f"🔄 Знайдено {len(dialogs)} чатів, {total_unread} повідомлень.\n"
-            f"Обробляю топ {len(sorted_dialogs)}..."
+            f"📬 <b>{total_unread} непрочитаних у {len(all_dialogs)} чатах</b>\n"
+            f"👤 {len(dm_dialogs)} DM  •  💬 {len(group_dialogs)} груп  •  📰 {len(channel_dialogs)} каналів\n\n"
+            f"Зараз обробляю...",
+            parse_mode="HTML",
         )
 
-        # Collect messages in batches
         provider = get_primary_provider()
-        all_summaries: list[str] = []
-        chat_list_lines: list[str] = []
 
-        for batch_idx in range(0, len(sorted_dialogs), CATCHUP_BATCH):
-            batch = sorted_dialogs[batch_idx:batch_idx + CATCHUP_BATCH]
-            batch_num = batch_idx // CATCHUP_BATCH + 1
-            total_batches = (len(sorted_dialogs) + CATCHUP_BATCH - 1) // CATCHUP_BATCH
-
+        # ── Helpers ──
+        async def _read_dialog(dialog, limit: int = 5) -> dict | None:
+            msgs = []
             try:
-                await loading.edit_text(
-                    f"🔄 Обробляю батч {batch_num}/{total_batches}..."
-                )
+                async for msg in client.iter_messages(dialog.id, limit=limit):
+                    if msg.text:
+                        sender = getattr(msg.sender, "first_name", "") if msg.sender else ""
+                        text = msg.text[:100]
+                        msgs.append(f"{sender}: {text}" if sender else text)
             except Exception:
-                pass
+                return None
+            if not msgs:
+                return None
+            return {"chat": dialog.name or "Unknown", "unread": dialog.unread_count, "messages": msgs}
 
-            # Read messages for this batch
-            batch_items = []
-            for dialog in batch:
-                chat_name = dialog.name or "Unknown"
-                limit = min(dialog.unread_count, 10)
-                chat_list_lines.append(f"💬 <b>{e(chat_name)}</b> — {dialog.unread_count}")
+        async def _summarize(items: list[dict], system_prompt: str) -> str:
+            if not items:
+                return ""
+            try:
+                response = await asyncio.wait_for(
+                    provider.client.chat.completions.create(
+                        model=provider.model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
+                        ],
+                        max_tokens=600,
+                        temperature=0.3,
+                    ),
+                    timeout=40,
+                )
+                return (response.choices[0].message.content or "").strip()
+            except Exception:
+                return "\n".join(f"• {i['chat']} ({i['unread']} непрочитаних)" for i in items)
 
-                messages_text = []
-                try:
-                    async for msg in client.iter_messages(dialog.id, limit=limit):
-                        if msg.text:
-                            sender = getattr(msg.sender, "first_name", "") if msg.sender else ""
-                            text = msg.text[:120]
-                            messages_text.append(f"{sender}: {text}" if sender else text)
-                except Exception:
-                    continue
+        async def _send_section(title: str, icon: str, count: int, summary: str):
+            if not summary:
+                return
+            text = f"<b>{icon} {title} ({count})</b>\n<blockquote expandable>{e(summary)}</blockquote>"
+            if len(text) > 4000:
+                text = text[:3990] + "</blockquote>"
+            await message.answer(text, parse_mode="HTML", link_preview_options=no_preview)
 
-                if messages_text:
-                    batch_items.append({
-                        "chat": chat_name,
-                        "unread": dialog.unread_count,
-                        "messages": messages_text[:6],
-                    })
+        # ── Step 2: DMs (send immediately) ──
+        if dm_dialogs:
+            dm_items = []
+            for d in sorted(dm_dialogs, key=lambda x: -x.unread_count):
+                item = await _read_dialog(d, limit=5)
+                if item:
+                    dm_items.append(item)
 
-            # AI summarize this batch
-            if batch_items:
-                try:
-                    response = await asyncio.wait_for(
-                        provider.client.chat.completions.create(
-                            model=provider.model,
-                            messages=[
-                                {"role": "system", "content": (
-                                    "Ти аналізуєш непрочитані повідомлення з Telegram чатів.\n"
-                                    "Для КОЖНОГО чату напиши:\n"
-                                    "НАЗВА ЧАТУ\n"
-                                    "2-3 речення: про що говорили, що важливого, чи є дії/запити.\n\n"
-                                    "Пиши ТІЛЬКИ українською. Будь конкретним — не просто 'обговорювали різне'."
-                                )},
-                                {"role": "user", "content": json.dumps(batch_items, ensure_ascii=False)},
-                            ],
-                            max_tokens=600,
-                            temperature=0.3,
-                        ),
-                        timeout=30,
-                    )
-                    batch_summary = response.choices[0].message.content or ""
-                    if batch_summary.strip():
-                        all_summaries.append(batch_summary.strip())
-                except Exception:
-                    # Fallback: list chat names with message preview
-                    for item in batch_items:
-                        preview = item["messages"][0][:80] if item["messages"] else ""
-                        all_summaries.append(f"{item['chat']} ({item['unread']})\n{preview}")
+            dm_summary = await _summarize(dm_items, (
+                "Підсумуй кожен особистий діалог українською.\n"
+                "Формат: ІМ'Я — що писали, чи є запит/дія. 1-2 речення на кожен.\n"
+                "Тільки текст."
+            ))
+            await _send_section("Особисті", "👤", len(dm_dialogs), dm_summary)
 
-        # Build final message(s)
+        # ── Step 3: Groups (in batches) ──
+        if group_dialogs:
+            sorted_groups = sorted(group_dialogs, key=lambda x: -x.unread_count)
+            group_items = []
+            for d in sorted_groups:
+                item = await _read_dialog(d, limit=5)
+                if item:
+                    group_items.append(item)
+
+            # Process in batches
+            for i in range(0, len(group_items), BATCH):
+                batch = group_items[i:i + BATCH]
+                batch_num = i // BATCH + 1
+                total_batches = (len(group_items) + BATCH - 1) // BATCH
+                label = f"Групи {batch_num}/{total_batches}" if total_batches > 1 else "Групи"
+
+                summary = await _summarize(batch, (
+                    "Підсумуй кожну групу українською.\n"
+                    "Формат: НАЗВА — про що говорили, що важливого. 1-2 речення.\n"
+                    "Тільки текст."
+                ))
+                await _send_section(label, "💬", len(batch), summary)
+
+        # ── Step 4: Channels (in batches) ──
+        if channel_dialogs:
+            sorted_channels = sorted(channel_dialogs, key=lambda x: -x.unread_count)
+            channel_items = []
+            for d in sorted_channels:
+                item = await _read_dialog(d, limit=3)
+                if item:
+                    channel_items.append(item)
+
+            for i in range(0, len(channel_items), BATCH):
+                batch = channel_items[i:i + BATCH]
+                batch_num = i // BATCH + 1
+                total_batches = (len(channel_items) + BATCH - 1) // BATCH
+                label = f"Канали {batch_num}/{total_batches}" if total_batches > 1 else "Канали"
+
+                summary = await _summarize(batch, (
+                    "Підсумуй кожен канал українською.\n"
+                    "Формат: НАЗВА — перелічи 2-3 основні теми/новини. 1 речення.\n"
+                    "Тільки текст."
+                ))
+                await _send_section(label, "📰", len(batch), summary)
+
+        # ── Done ──
         await loading.delete()
-
-        header = f"<b>📬 Непрочитані: {total_unread} повідомлень у {len(dialogs)} чатах</b>\n"
-
-        if all_summaries:
-            full_summary = "\n\n".join(all_summaries)
-
-            msg1_text = header + f"\n<blockquote expandable>{e(full_summary)}</blockquote>"
-
-            if len(msg1_text) > 4000:
-                mid = len(all_summaries) // 2
-                part1 = "\n\n".join(all_summaries[:mid])
-                part2 = "\n\n".join(all_summaries[mid:])
-                await message.answer(
-                    header + f"\n<blockquote expandable>{e(part1)}</blockquote>",
-                    parse_mode="HTML",
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                )
-                await message.answer(
-                    f"<blockquote expandable>{e(part2)}</blockquote>",
-                    parse_mode="HTML",
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                    reply_markup=main_keyboard(),
-                )
-            else:
-                await message.answer(
-                    msg1_text,
-                    parse_mode="HTML",
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                    reply_markup=main_keyboard(),
-                )
-        else:
-            # No summaries — just show chat list
-            chat_list = "\n".join(chat_list_lines[:15])
-            if len(dialogs) > 15:
-                chat_list += f"\n\n<i>...та ще {len(dialogs) - 15} чатів</i>"
-            await message.answer(
-                header + "\n" + chat_list,
-                parse_mode="HTML",
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                reply_markup=main_keyboard(),
-            )
+        await message.answer(
+            f"✅ <b>Catchup завершено!</b> Оброблено {len(all_dialogs)} чатів.",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
 
     except Exception as ex:
         import traceback
