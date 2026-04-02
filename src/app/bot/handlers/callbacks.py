@@ -1,14 +1,21 @@
 from datetime import datetime, timedelta, timezone
 
-from aiogram import Router
-from aiogram.types import CallbackQuery
+from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 
 from src.app.db.models import Task, UserSettings
+from src.app.db.models import Message as DbMessage
 from src.app.db.session import async_session
 from src.app.config import settings
 
 router = Router()
+
+
+class ReplyState(StatesGroup):
+    waiting_text = State()
 
 
 # ── Chat approval (from Telethon collector) ─────────────────
@@ -153,3 +160,68 @@ async def digest_navigate(callback: CallbackQuery) -> None:
             )
     except Exception:
         pass
+
+
+# ── Quick Reply ─────────────────────────────────────────────
+
+@router.callback_query(lambda c: c.data and c.data.startswith("reply:"))
+async def start_reply(callback: CallbackQuery, state: FSMContext) -> None:
+    msg_id = int(callback.data.split(":")[1])
+
+    # Load original message to show context
+    async with async_session() as session:
+        msg = await session.get(DbMessage, msg_id)
+
+    if not msg:
+        await callback.answer("Повідомлення не знайдено")
+        return
+
+    chat_name = msg.source_chat or "чат"
+    meta = msg.raw_metadata or {}
+
+    await state.set_state(ReplyState.waiting_text)
+    await state.update_data(
+        chat_id=meta.get("chat_id"),
+        message_id=meta.get("message_id"),
+        chat_name=chat_name,
+    )
+
+    await callback.answer()
+    await callback.message.answer(
+        f"↩️ <b>Відповідь у {chat_name}</b>\n\nНапишіть текст відповіді:",
+        parse_mode="HTML",
+    )
+
+
+@router.message(ReplyState.waiting_text, F.text)
+async def send_reply(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    chat_id = data.get("chat_id")
+    original_msg_id = data.get("message_id")
+    chat_name = data.get("chat_name", "чат")
+
+    await state.clear()
+
+    if not chat_id:
+        await message.answer("❌ Не вдалось визначити чат.")
+        return
+
+    try:
+        import src.app.shared as shared
+        client = shared.telethon_client
+        if not client:
+            await message.answer("❌ Telethon не підключений.")
+            return
+
+        await client.send_message(
+            int(chat_id),
+            message.text,
+            reply_to=int(original_msg_id) if original_msg_id else None,
+        )
+
+        await message.answer(
+            f"✅ <b>Відповідь надіслана</b> у {chat_name}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await message.answer(f"❌ Помилка: {e}")

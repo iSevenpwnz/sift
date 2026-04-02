@@ -54,6 +54,10 @@ async def lifespan(app: FastAPI):
     if not await userbot.is_user_authorized():
         logger.error("Telethon session not authorized. Run scripts/generate_session.py locally first.")
         raise RuntimeError("Telethon not authorized")
+
+    # Share Telethon client for quick reply from bot handlers
+    import src.app.shared as shared
+    shared.telethon_client = userbot
     await setup_bot_commands(bot)
     polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
     logger.info("aiogram bot started")

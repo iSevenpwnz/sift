@@ -1,4 +1,5 @@
 import asyncio
+import html as html_mod
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
@@ -362,15 +363,16 @@ async def _create_task(msg: Message, ai_result: dict) -> Task | None:
     if ai_result.get("date"):
         due_date = _parse_ai_date(ai_result["date"])
 
-    # Dedup: don't create if similar active task exists
+    # Dedup: don't create if similar active task exists (fuzzy — first 20 chars)
     async with async_session() as session:
-        existing = await session.execute(
-            select(Task)
-            .where(Task.is_done.is_(False))
-            .where(func.lower(Task.title) == topic.strip().lower())
+        result = await session.execute(
+            select(Task).where(Task.is_done.is_(False))
         )
-        if existing.scalar_one_or_none():
-            return None
+        active_tasks = list(result.scalars().all())
+        topic_key = topic.strip().lower()[:20]
+        for t in active_tasks:
+            if t.title.strip().lower()[:20] == topic_key:
+                return None
 
         task = Task(message_id=msg.id, title=topic, due_date=due_date)
         session.add(task)
@@ -522,46 +524,119 @@ def _format_grouped(chat_name: str, items: list[NotificationItem]) -> str:
     return text
 
 
+# Cache: chat_name → (bot_message_id, list of NotificationItems sent today)
+_notification_cache: dict[str, tuple[int, list[NotificationItem]]] = {}
+
+
+async def _format_summarized(chat_name: str, items: list[NotificationItem]) -> str:
+    """Format notification using chat daily summary from DB."""
+    from src.app.db.models import ChatDailySummary
+
+    e = html_mod.escape
+    count = len(items)
+    noun = "повідомлення" if 2 <= count <= 4 else "повідомлень" if count >= 5 else "повідомлення"
+
+    # Load summary from DB
+    summary = ""
+    try:
+        today = date.today()
+        async with async_session() as session:
+            result = await session.execute(
+                select(ChatDailySummary)
+                .where(ChatDailySummary.chat_name == chat_name)
+                .where(ChatDailySummary.summary_date == today)
+            )
+            row = result.scalar_one_or_none()
+            if row:
+                summary = row.summary_text
+    except Exception:
+        pass
+
+    text = f"<b>{e(chat_name)}</b> • {count} {noun}\n\n"
+
+    if summary:
+        text += f"<blockquote expandable>{e(summary)}</blockquote>\n"
+    else:
+        # Fallback: list topics
+        for item in items[-5:]:  # last 5
+            text += f"{item.icon} {e(item.topic)}\n"
+            text += f"    <i>{e(item.sender)} • {item.time_str}</i>\n"
+
+    # Action items at the bottom
+    actions = [i for i in items if i.ai_result.get("category") in ("meeting", "task", "deadline")]
+    if actions:
+        seen = set()
+        for a in actions:
+            key = a.topic[:20].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            text += f"\n{a.icon} {e(a.topic)}"
+            if a.ai_result.get("date"):
+                text += f" — {_format_date(a.ai_result['date'])}"
+
+    return text
+
+
 async def _flush_notifications(bot: Bot, buffer: list[NotificationItem]) -> None:
+    from src.app.bot.keyboards import notification_keyboard
+
     groups: dict[str, list[NotificationItem]] = defaultdict(list)
     for item in buffer:
         key = item.msg.source_chat or "—"
         groups[key].append(item)
 
-    for chat_name, items in groups.items():
-        has_task = any(i.task for i in items)
-        is_high = any(i.priority == "high" for i in items)
+    for chat_name, new_items in groups.items():
+        is_high = any(i.priority == "high" for i in new_items)
 
-        if len(items) == 1:
-            item = items[0]
-            text = _format_single(item)
-            reply_markup = task_keyboard(item.task.id) if item.task else None
-        else:
-            text = _format_grouped(chat_name, items)
-            if has_task:
-                task_items = [i for i in items if i.task]
-                buttons = []
-                for ti in task_items:
-                    short = ti.topic[:20] + ("..." if len(ti.topic) > 20 else "")
-                    buttons.append([
-                        InlineKeyboardButton(text=f"✅ {short}", callback_data=f"task_done:{ti.task.id}", style="success"),
-                        InlineKeyboardButton(text="⏰ 1г", callback_data=f"task_snooze:{ti.task.id}:1", style="primary"),
-                    ])
-                reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        # Check if we already have a notification for this chat — edit it
+        cached = _notification_cache.get(chat_name)
+        if cached:
+            bot_msg_id, prev_items = cached
+            all_items = prev_items + new_items
+
+            # 3+ items → use AI summary instead of individual list
+            if len(all_items) >= 3:
+                text = await _format_summarized(chat_name, all_items)
             else:
-                reply_markup = None
+                text = _format_grouped(chat_name, all_items)
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=settings.telegram_owner_id,
+                    message_id=bot_msg_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+                _notification_cache[chat_name] = (bot_msg_id, all_items)
+                continue
+            except Exception:
+                pass  # Edit failed (too old, deleted) — send new
+
+        # Build text
+        if len(new_items) == 1:
+            item = new_items[0]
+            text = _format_single(item)
+            if item.task:
+                reply_markup = task_keyboard(item.task.id, msg_id=item.msg.id)
+            else:
+                reply_markup = notification_keyboard(item.msg.id)
+        else:
+            text = _format_grouped(chat_name, new_items)
+            reply_markup = None
 
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=settings.telegram_owner_id,
                 text=text,
                 parse_mode="HTML",
                 disable_notification=(not is_high),
                 reply_markup=reply_markup,
             )
+            _notification_cache[chat_name] = (sent.message_id, new_items)
         except Exception:
-            msg_ids = [i.msg.id for i in items]
-            logger.exception(f"Failed to send grouped notification for messages {msg_ids}")
+            msg_ids = [i.msg.id for i in new_items]
+            logger.exception(f"Failed to send notification for messages {msg_ids}")
 
 
 # ── Main processor loop ──────────────────────────────────────

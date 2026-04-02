@@ -1,3 +1,5 @@
+import asyncio
+
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, BotCommandScopeDefault, Message
@@ -21,6 +23,7 @@ async def setup_bot_commands(bot) -> None:
             BotCommand(command="summary", description="Дайджест повідомлень"),
             BotCommand(command="tasks", description="Активні таски"),
             BotCommand(command="week", description="План на тиждень"),
+            BotCommand(command="catchup", description="Дайджест непрочитаних"),
             BotCommand(command="search", description="Пошук повідомлень"),
             BotCommand(command="history", description="Історія за дату"),
             BotCommand(command="mute", description="Вимкнути нотифікації (1h)"),
@@ -376,6 +379,129 @@ async def cmd_status(message: Message) -> None:
     ]
 
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_keyboard())
+
+
+# ── Catchup ─────────────────────────────────────────────────
+
+@router.message(Command("catchup"))
+async def cmd_catchup(message: Message) -> None:
+    """Scan all unread messages and create a digest."""
+    import html as html_mod
+    from aiogram.types import LinkPreviewOptions
+
+    loading = await message.answer("🔄 Сканую непрочитані повідомлення...")
+
+    try:
+        import src.app.shared as shared
+        client = shared.telethon_client
+        if not client:
+            await loading.edit_text("❌ Telethon не підключений.")
+            return
+
+        # Get all dialogs with unread messages
+        dialogs = []
+        async for dialog in client.iter_dialogs():
+            if dialog.unread_count > 0 and dialog.unread_count < 500:
+                dialogs.append(dialog)
+
+        if not dialogs:
+            await loading.edit_text("✅ Немає непрочитаних повідомлень!")
+            return
+
+        await loading.edit_text(f"🔄 Знайдено {len(dialogs)} чатів з непрочитаними. Читаю...")
+
+        # Collect messages from top chats (by unread count)
+        e = html_mod.escape
+        chat_data: dict[str, list[str]] = {}
+        total_unread = 0
+
+        for dialog in sorted(dialogs, key=lambda d: -d.unread_count)[:20]:
+            chat_name = dialog.name or "Unknown"
+            limit = min(dialog.unread_count, 15)
+            total_unread += dialog.unread_count
+
+            messages_text = []
+            async for msg in client.iter_messages(dialog.id, limit=limit):
+                if msg.text:
+                    sender = ""
+                    if msg.sender:
+                        sender = getattr(msg.sender, "first_name", "") or ""
+                    text = msg.text[:150]
+                    if sender:
+                        messages_text.append(f"{sender}: {text}")
+                    else:
+                        messages_text.append(text)
+
+            if messages_text:
+                chat_data[chat_name] = messages_text
+
+        if not chat_data:
+            await loading.edit_text("✅ Нічого цікавого в непрочитаних.")
+            return
+
+        await loading.edit_text(f"🔄 Сумаризую {len(chat_data)} чатів...")
+
+        # Summarize with AI
+        from src.app.processors.ai_provider import get_primary_provider
+        import json
+
+        items = [
+            {"chat": name, "count": len(msgs), "messages": msgs[:8]}
+            for name, msgs in chat_data.items()
+        ]
+
+        provider = get_primary_provider()
+        summary_text = ""
+        try:
+            response = await asyncio.wait_for(
+                provider.client.chat.completions.create(
+                    model=provider.model,
+                    messages=[
+                        {"role": "system", "content": (
+                            "Створи стислий дайджест непрочитаних повідомлень українською. "
+                            "Для кожного чату — 1-2 речення. Що важливого? Хто що просив? "
+                            "Відповідай тільки текстом, без JSON."
+                        )},
+                        {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
+                    ],
+                    max_tokens=500,
+                    temperature=0.3,
+                ),
+                timeout=30,
+            )
+            summary_text = response.choices[0].message.content or ""
+        except Exception:
+            pass
+
+        # Build response
+        lines = [f"<b>📬 Непрочитані: {total_unread} повідомлень у {len(dialogs)} чатах</b>\n"]
+
+        if summary_text:
+            lines.append(f"<blockquote expandable>{e(summary_text)}</blockquote>\n")
+
+        lines.append("<b>Чати:</b>")
+        for dialog in sorted(dialogs, key=lambda d: -d.unread_count)[:15]:
+            lines.append(f"  💬 <b>{e(dialog.name or 'Unknown')}</b> — {dialog.unread_count} непрочитаних")
+
+        if len(dialogs) > 15:
+            lines.append(f"\n  <i>...та ще {len(dialogs) - 15} чатів</i>")
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3990] + "\n\n<i>...обрізано</i>"
+
+        await loading.delete()
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as ex:
+        import traceback
+        traceback.print_exc()
+        await loading.edit_text(f"❌ Помилка: {ex}")
 
 
 # ── Search ──────────────────────────────────────────────────

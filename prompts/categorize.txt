@@ -55,15 +55,20 @@ IMPORTANT context rules:
 
 ## Date extraction (critical!)
 
-ALWAYS convert relative dates to absolute ISO 8601 using {current_datetime} as reference:
+Convert relative dates to absolute ISO 8601 using {current_datetime} as reference:
 - "завтра о 14" → next day at 14:00
-- "в п'ятницю" → next Friday
+- "в п'ятницю" → next Friday at 00:00 (NO specific time invented!)
 - "через годину" → current time + 1h
 - "о 11", "в 11" → today at 11:00 (or tomorrow if already past 11)
 - "після обіду" → today at 14:00
 - "до кінця тижня" → this Friday at 18:00
 
-Return null ONLY if there is absolutely no time reference in the message.
+CRITICAL: NEVER invent a specific time if it was NOT mentioned in the message!
+- "в п'ятницю" → "2026-04-04T00:00:00" (date only, midnight = no specific time)
+- "завтра" → "2026-04-03T00:00:00" (no time mentioned = midnight)
+- "завтра о 15" → "2026-04-03T15:00:00" (time WAS mentioned)
+
+Return null ONLY if there is absolutely no date or time reference.
 
 ## Topic
 
