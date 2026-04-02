@@ -146,6 +146,10 @@ async def digest_navigate(callback: CallbackQuery) -> None:
             await callback.message.delete()
             await _send_digest(callback.bot, content, keyboard)
         else:
-            await callback.message.edit_text(text=content, parse_mode="HTML", reply_markup=keyboard)
+            from aiogram.types import LinkPreviewOptions
+            await callback.message.edit_text(
+                text=content, parse_mode="HTML", reply_markup=keyboard,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
     except Exception:
         pass

@@ -57,13 +57,22 @@ async def cmd_summary(message: Message) -> None:
     today = dt.now(ZoneInfo("Europe/Kyiv")).date()
     content, keyboard = await build_digest(today)
 
+    from aiogram.types import LinkPreviewOptions
+    no_preview = LinkPreviewOptions(is_disabled=True)
+
     await loading.delete()
     if isinstance(content, list):
         for i, part in enumerate(content):
             is_last = i == len(content) - 1
-            await message.answer(text=part, parse_mode="HTML", reply_markup=keyboard if is_last else None)
+            await message.answer(
+                text=part, parse_mode="HTML", link_preview_options=no_preview,
+                reply_markup=keyboard if is_last else None,
+            )
     else:
-        await message.answer(text=content, parse_mode="HTML", reply_markup=keyboard)
+        await message.answer(
+            text=content, parse_mode="HTML", link_preview_options=no_preview,
+            reply_markup=keyboard,
+        )
 
 
 # ── Tasks (slash + button) ──────────────────────────────────

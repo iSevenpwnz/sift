@@ -340,7 +340,10 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
 
 
 async def _send_digest(bot: Bot, content, keyboard: InlineKeyboardMarkup) -> None:
-    """Send digest — handles string, list of strings."""
+    """Send digest — handles string, list of strings. No link previews."""
+    from aiogram.types import LinkPreviewOptions
+    no_preview = LinkPreviewOptions(is_disabled=True)
+
     if isinstance(content, list):
         for i, part in enumerate(content):
             is_last = i == len(content) - 1
@@ -348,6 +351,7 @@ async def _send_digest(bot: Bot, content, keyboard: InlineKeyboardMarkup) -> Non
                 chat_id=settings.telegram_owner_id,
                 text=part,
                 parse_mode="HTML",
+                link_preview_options=no_preview,
                 reply_markup=keyboard if is_last else None,
             )
     else:
@@ -355,6 +359,7 @@ async def _send_digest(bot: Bot, content, keyboard: InlineKeyboardMarkup) -> Non
             chat_id=settings.telegram_owner_id,
             text=content,
             parse_mode="HTML",
+            link_preview_options=no_preview,
             reply_markup=keyboard,
         )
 
