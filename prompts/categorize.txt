@@ -63,12 +63,19 @@ Convert relative dates to absolute ISO 8601 using {current_datetime} as referenc
 - "після обіду" → today at 14:00
 - "до кінця тижня" → this Friday at 18:00
 
-CRITICAL: NEVER invent a specific time if it was NOT mentioned in the message!
+CRITICAL rules:
+- NEVER invent a specific time if it was NOT mentioned in the message!
 - "в п'ятницю" → "2026-04-04T00:00:00" (date only, midnight = no specific time)
-- "завтра" → "2026-04-03T00:00:00" (no time mentioned = midnight)
 - "завтра о 15" → "2026-04-03T15:00:00" (time WAS mentioned)
 
-Return null ONLY if there is absolutely no date or time reference.
+Extract date ONLY if the message describes a PLANNED EVENT or ACTION:
+- "зустріч завтра о 14" → extract (it's a planned event)
+- "дедлайн в п'ятницю" → extract (it's a deadline)
+- "сьогодні урожайний день" → null (just a statement, no event)
+- "вчора було круто" → null (past, no action)
+- "завтра буде дощ" → null (weather, no action)
+
+Return null if the date/time word is used casually, not as a planned event.
 
 ## Topic
 
