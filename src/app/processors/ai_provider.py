@@ -15,14 +15,28 @@ logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).parent.parent.parent.parent / "prompts" / "categorize.txt"
 
 
-def _get_system_prompt() -> str:
+def _get_system_prompt(important_people: list[dict] | None = None) -> str:
     template = PROMPT_PATH.read_text() if PROMPT_PATH.exists() else "Categorize messages. Return JSON."
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    return template.replace("{current_datetime}", now)
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d %H:%M (Kyiv time)")
+    prompt = template.replace("{current_datetime}", now)
+
+    # Build important people section
+    if important_people:
+        lines = "\n".join(
+            f"- {p.get('name', '')} ({p.get('relation', p.get('role', ''))}) — {p.get('priority', 'high priority')}"
+            for p in important_people
+        )
+        section = f"## Important people\n{lines}"
+    else:
+        section = ""
+    prompt = prompt.replace("{important_people_section}", section)
+
+    return prompt
 
 
 class AIProvider(Protocol):
-    async def categorize(self, messages: list[dict]) -> list[dict]: ...
+    async def categorize(self, messages: list[dict], important_people: list[dict] | None = None) -> list[dict]: ...
 
 
 class OpenAICompatibleProvider:
@@ -33,12 +47,12 @@ class OpenAICompatibleProvider:
         self.model = model
 
     @retry(wait=wait_exponential(min=1, max=60), stop=stop_after_attempt(3))
-    async def categorize(self, messages: list[dict]) -> list[dict]:
+    async def categorize(self, messages: list[dict], important_people: list[dict] | None = None) -> list[dict]:
         user_content = json.dumps({"messages": messages}, ensure_ascii=False)
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": _get_system_prompt()},
+                {"role": "system", "content": _get_system_prompt(important_people)},
                 {"role": "user", "content": user_content},
             ],
             response_format={"type": "json_object"},
@@ -60,13 +74,14 @@ class GeminiProvider:
         self.model = model
 
     @retry(wait=wait_exponential(min=1, max=60), stop=stop_after_attempt(3))
-    async def categorize(self, messages: list[dict]) -> list[dict]:
+    async def categorize(self, messages: list[dict], important_people: list[dict] | None = None) -> list[dict]:
         user_content = json.dumps({"messages": messages}, ensure_ascii=False)
+        system = _get_system_prompt(important_people)
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: self.client.models.generate_content(
                 model=self.model,
-                contents=f"{_get_system_prompt()}\n\n{user_content}",
+                contents=f"{system}\n\n{user_content}",
                 config={"response_mime_type": "application/json"},
             ),
         )

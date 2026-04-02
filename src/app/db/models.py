@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -89,6 +89,23 @@ class UserSettings(Base):
     monitored_chats: Mapped[dict] = mapped_column(JSONB, default=list)
     ignored_chats: Mapped[dict] = mapped_column(JSONB, default=list)
     quiet_hours: Mapped[dict] = mapped_column(JSONB, default=dict)
+    important_people: Mapped[dict] = mapped_column(JSONB, default=list)
     digest_time: Mapped[str] = mapped_column(String(5), default="09:00")
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Kyiv")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ChatDailySummary(Base):
+    __tablename__ = "chat_daily_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary_date: Mapped[date] = mapped_column(Date, nullable=False)
+    summary_text: Mapped[str] = mapped_column(Text, default="")
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("chat_name", "summary_date", name="uq_chat_daily_summary"),
+        Index("idx_chat_summary_date", "summary_date"),
+    )

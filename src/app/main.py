@@ -15,7 +15,7 @@ from src.app.collectors.telegram import create_userbot, register_handlers
 from src.app.config import settings
 from src.app.db.session import engine
 from src.app.processors.pipeline import message_processor, process_raw_backlog, requeue_pending
-from src.app.scheduler.jobs import check_snoozed_tasks, cleanup_old_data, daily_digest, retry_pending_ai
+from src.app.scheduler.jobs import check_reminders, check_snoozed_tasks, cleanup_old_data, daily_digest, retry_pending_ai
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,12 @@ async def lifespan(app: FastAPI):
         IntervalTrigger(seconds=60),
         args=[bot],
         id="check_snoozed_tasks",
+    )
+    scheduler.add_job(
+        check_reminders,
+        IntervalTrigger(seconds=60),
+        args=[bot],
+        id="check_reminders",
     )
     scheduler.add_job(
         cleanup_old_data,

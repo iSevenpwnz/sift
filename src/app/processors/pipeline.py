@@ -2,7 +2,8 @@ import asyncio
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
@@ -10,13 +11,15 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.app.db.models import Message, Task
+from src.app.db.models import ChatDailySummary, Message, Task, UserSettings
 from src.app.db.session import async_session
 from src.app.constants import CATEGORY_ICONS
 from src.app.processors.ai_provider import get_fallback_provider, get_primary_provider
 from src.app.processors.filter_l1 import should_process
 from src.app.bot.keyboards import task_keyboard
 from src.app.config import settings
+
+SUMMARY_PROMPT_PATH = Path(__file__).parent.parent.parent.parent / "prompts" / "update_summary.txt"
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +131,89 @@ async def claim_raw_messages(limit: int = BATCH_SIZE) -> list[Message]:
         return messages
 
 
+async def update_chat_summaries(messages: list[Message], result_map: dict) -> None:
+    """Incrementally update daily chat summaries for non-noise messages."""
+    try:
+        today = date.today()
+        non_noise = [
+            m for m in messages
+            if result_map.get(m.id, {}).get("category") not in (None, "noise")
+        ]
+        logger.info(f"update_chat_summaries: {len(messages)} msgs, {len(non_noise)} non-noise")
+        if not non_noise:
+            return
+
+        groups: dict[str, list[Message]] = defaultdict(list)
+        for msg in non_noise:
+            chat = msg.source_chat or "Unknown"
+            groups[chat].append(msg)
+
+        template = SUMMARY_PROMPT_PATH.read_text() if SUMMARY_PROMPT_PATH.exists() else ""
+        if not template:
+            return
+
+        async with async_session() as session:
+            existing_result = await session.execute(
+                select(ChatDailySummary).where(
+                    ChatDailySummary.summary_date == today,
+                    ChatDailySummary.chat_name.in_(list(groups.keys())),
+                )
+            )
+            existing = {s.chat_name: s for s in existing_result.scalars().all()}
+
+        provider = get_primary_provider()
+
+        for chat_name, msgs in groups.items():
+            try:
+                current = existing.get(chat_name)
+                current_summary = current.summary_text if current else ""
+                current_count = current.message_count if current else 0
+
+                new_messages = "\n".join(
+                    f"- {m.sender or 'Unknown'}: {m.content[:150]}" for m in msgs
+                )
+
+                prompt = template.replace("{current_summary}", current_summary).replace("{new_messages}", new_messages)
+
+                response = await asyncio.wait_for(
+                    provider.client.chat.completions.create(
+                        model=provider.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=200,
+                        temperature=0.3,
+                    ),
+                    timeout=25,
+                )
+                summary_text = response.choices[0].message.content or ""
+
+                async with async_session() as session:
+                    stmt = (
+                        pg_insert(ChatDailySummary)
+                        .values(
+                            chat_name=chat_name,
+                            summary_date=today,
+                            summary_text=summary_text.strip(),
+                            message_count=current_count + len(msgs),
+                        )
+                        .on_conflict_do_update(
+                            constraint="uq_chat_daily_summary",
+                            set_={
+                                "summary_text": summary_text.strip(),
+                                "message_count": current_count + len(msgs),
+                                "last_updated": func.now(),
+                            },
+                        )
+                    )
+                    await session.execute(stmt)
+                    await session.commit()
+
+            except Exception:
+                logger.warning(f"Failed to update summary for chat {chat_name}", exc_info=True)
+
+    except Exception:
+        logger.warning("Failed to update chat summaries", exc_info=True)
+
+
 async def process_messages(messages: list[Message], bot: Bot | None = None) -> None:
     """Process a batch: L1 filter → L2 AI → save → notify."""
     if not messages:
@@ -153,11 +239,42 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
     if not to_ai:
         return
 
+    # Load chat context summaries for today
+    today = date.today()
+    chat_names = list({m.source_chat for m in to_ai if m.source_chat})
+    chat_context_map: dict[str, str] = {}
+    if chat_names:
+        try:
+            async with async_session() as session:
+                result = await session.execute(
+                    select(ChatDailySummary).where(
+                        ChatDailySummary.summary_date == today,
+                        ChatDailySummary.chat_name.in_(chat_names),
+                    )
+                )
+                chat_context_map = {s.chat_name: s.summary_text for s in result.scalars().all()}
+        except Exception:
+            logger.warning("Failed to load chat summaries for context", exc_info=True)
+
+    # Load important_people from user settings
+    important_people = None
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(UserSettings).where(UserSettings.telegram_user_id == settings.telegram_owner_id)
+            )
+            us = result.scalar_one_or_none()
+            if us and us.important_people:
+                important_people = us.important_people
+    except Exception:
+        logger.warning("Failed to load important_people", exc_info=True)
+
     # L2 AI categorization
     ai_input = [
         {
             "id": msg.id,
             "chat": msg.source_chat or "",
+            "chat_context": chat_context_map.get(msg.source_chat or "", ""),
             "sender": msg.sender or "",
             "text": msg.content,
             "reply_to": msg.reply_to_text,
@@ -167,11 +284,11 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
     ]
 
     try:
-        results = await get_primary_provider().categorize(ai_input)
+        results = await get_primary_provider().categorize(ai_input, important_people)
     except Exception:
         logger.warning("Primary AI failed, trying fallback")
         try:
-            results = await get_fallback_provider().categorize(ai_input)
+            results = await get_fallback_provider().categorize(ai_input, important_people)
         except Exception:
             logger.exception("All AI providers failed")
             async with async_session() as session:
@@ -212,12 +329,15 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
 
         await session.commit()
 
+    await update_chat_summaries(to_ai, result_map)
+
     for msg in to_ai:
         ai_result = result_map.get(msg.id, {})
         if not ai_result:
             continue
 
         task = await _create_task(msg, ai_result)
+        await _create_reminder(msg, ai_result)
 
         if bot:
             item = await _prepare_notification(msg, ai_result, task)
@@ -259,9 +379,42 @@ async def _create_task(msg: Message, ai_result: dict) -> Task | None:
         return task
 
 
+async def _create_reminder(msg: Message, ai_result: dict) -> None:
+    """Create a Reminder if AI suggests one."""
+    reminder_str = ai_result.get("reminder")
+    if not reminder_str:
+        return
+
+    remind_at = _parse_ai_date(reminder_str)
+    if not remind_at:
+        return
+
+    # Don't create reminders in the past
+    if remind_at <= datetime.now(USER_TZ):
+        return
+
+    try:
+        from src.app.db.models import Reminder
+        async with async_session() as session:
+            # Dedup: don't create if similar reminder exists
+            existing = await session.execute(
+                select(Reminder)
+                .where(Reminder.message_id == msg.id)
+                .where(Reminder.sent.is_(False))
+            )
+            if existing.scalar_one_or_none():
+                return
+
+            reminder = Reminder(message_id=msg.id, remind_at=remind_at)
+            session.add(reminder)
+            await session.commit()
+            logger.info(f"Created reminder for message {msg.id} at {remind_at}")
+    except Exception:
+        logger.warning(f"Failed to create reminder for message {msg.id}", exc_info=True)
+
+
 async def _is_quiet_or_muted() -> bool:
     """Check if quiet hours are active or bot is muted."""
-    from src.app.db.models import UserSettings
     async with async_session() as session:
         result = await session.execute(
             select(UserSettings).where(UserSettings.telegram_user_id == settings.telegram_owner_id)
@@ -299,8 +452,15 @@ async def _prepare_notification(msg: Message, ai_result: dict, task: Task | None
 
     if category == "noise":
         return None
+
+    # info/low from large channels — skip (noise-like)
     if category == "info" and priority == "low":
-        return None
+        meta = msg.raw_metadata or {}
+        chat_id = meta.get("chat_id", 0)
+        is_dm = isinstance(chat_id, int) and chat_id > 0
+        # DMs and personal groups — still notify silently
+        if not is_dm and not (msg.sender and msg.sender != "Unknown"):
+            return None  # channel info/low — skip
 
     quiet = await _is_quiet_or_muted()
 

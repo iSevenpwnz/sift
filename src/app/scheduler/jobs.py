@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import delete, func, select
 
 from src.app.constants import CATEGORY_ICONS
-from src.app.db.models import Message, Task, UserSettings
+from src.app.db.models import ChatDailySummary, Message, Task, UserSettings
 from src.app.db.session import async_session
 from src.app.config import settings
 from src.app.bot.keyboards import task_keyboard
@@ -199,8 +199,15 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
         else:
             group_chats[chat_name] = msgs
 
-    # AI summaries
-    summaries = await _summarize_groups(chat_groups)
+    # Load pre-built summaries from DB, fallback to AI generation
+    async with async_session() as session:
+        summary_result = await session.execute(
+            select(ChatDailySummary).where(ChatDailySummary.summary_date == target_date)
+        )
+        db_summaries = {s.chat_name: s.summary_text for s in summary_result.scalars().all()}
+    summaries = db_summaries
+    if not summaries:
+        summaries = await _summarize_groups(chat_groups)
 
     # ── Build HTML ──
     date_str = target_date.strftime("%d.%m")
@@ -418,6 +425,47 @@ async def check_snoozed_tasks(bot: Bot) -> None:
             logger.info(f"Sent {len(tasks)} snooze reminders")
 
 
+async def check_reminders(bot: Bot) -> None:
+    """Send reminders when their time comes."""
+    from src.app.db.models import Reminder
+    import html as html_mod
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Reminder).where(
+                Reminder.sent.is_(False),
+                Reminder.remind_at <= func.now(),
+            )
+        )
+        reminders = list(result.scalars().all())
+
+        for rem in reminders:
+            try:
+                # Load the original message for context
+                msg = await session.get(Message, rem.message_id) if rem.message_id else None
+                topic = ""
+                if msg:
+                    topic = msg.extracted_topic or msg.content[:100]
+
+                text = f"🔔 <b>Нагадування</b>\n{html_mod.escape(topic)}"
+                if msg and msg.source_chat:
+                    text += f"\n<i>{html_mod.escape(msg.source_chat)}</i>"
+
+                await bot.send_message(
+                    chat_id=settings.telegram_owner_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                logger.exception(f"Failed to send reminder {rem.id}")
+                continue
+            rem.sent = True
+
+        if reminders:
+            await session.commit()
+            logger.info(f"Sent {len(reminders)} reminders")
+
+
 async def cleanup_old_data(bot: Bot) -> None:
     """Delete processed messages and done tasks older than 30 days."""
     cutoff = datetime.now(tz=ZoneInfo("UTC")) - timedelta(days=30)
@@ -438,6 +486,11 @@ async def cleanup_old_data(bot: Bot) -> None:
         )
         tasks_deleted = task_result.rowcount
 
+        summary_result = await session.execute(
+            delete(ChatDailySummary).where(ChatDailySummary.summary_date < cutoff.date())
+        )
+        summaries_deleted = summary_result.rowcount
+
         await session.commit()
 
-    logger.info(f"Cleanup: deleted {messages_deleted} messages, {tasks_deleted} tasks")
+    logger.info(f"Cleanup: deleted {messages_deleted} messages, {tasks_deleted} tasks, {summaries_deleted} summaries")
