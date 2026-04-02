@@ -21,6 +21,7 @@ async def setup_bot_commands(bot) -> None:
             BotCommand(command="summary", description="Дайджест повідомлень"),
             BotCommand(command="tasks", description="Активні таски"),
             BotCommand(command="week", description="План на тиждень"),
+            BotCommand(command="search", description="Пошук повідомлень"),
             BotCommand(command="history", description="Історія за дату"),
             BotCommand(command="mute", description="Вимкнути нотифікації (1h)"),
             BotCommand(command="unmute", description="Увімкнути нотифікації"),
@@ -375,3 +376,78 @@ async def cmd_status(message: Message) -> None:
     ]
 
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_keyboard())
+
+
+# ── Search ──────────────────────────────────────────────────
+
+@router.message(Command("search"))
+async def cmd_search(message: Message) -> None:
+    """Search messages. Usage: /search keyword"""
+    import html as html_mod
+    from aiogram.types import LinkPreviewOptions
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        await message.answer(
+            "🔍 <b>Пошук</b>\n\n"
+            "<code>/search ключове слово</code>\n"
+            "<code>/search Ігор зустріч</code>\n"
+            "<code>/search DCF</code>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    query = args[1].strip()
+    e = html_mod.escape
+
+    async with async_session() as session:
+        pattern = f"%{query}%"
+        result = await session.execute(
+            select(DbMessage)
+            .where(
+                (DbMessage.content.ilike(pattern)) | (DbMessage.extracted_topic.ilike(pattern))
+            )
+            .where(DbMessage.category.is_not(None))
+            .order_by(DbMessage.created_at.desc())
+            .limit(15)
+        )
+        messages = list(result.scalars().all())
+
+    if not messages:
+        await message.answer(
+            f"🔍 <b>{e(query)}</b> — нічого не знайдено.",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    lines = [f"🔍 <b>{e(query)}</b> — {len(messages)} результатів\n"]
+
+    for msg in messages:
+        icon = CATEGORY_ICONS.get(msg.category, "💬")
+        topic = msg.extracted_topic or msg.content[:60]
+        chat = msg.source_chat or "—"
+        date_str = msg.created_at.strftime("%d.%m %H:%M") if msg.created_at else ""
+
+        meta = msg.raw_metadata or {}
+        cid = str(meta.get("chat_id", ""))
+        mid = meta.get("message_id")
+        link = f"https://t.me/c/{cid[4:]}/{mid}" if cid.startswith("-100") and mid else None
+
+        if link:
+            lines.append(f'{icon} <a href="{link}">{e(topic)}</a>')
+        else:
+            lines.append(f"{icon} {e(topic)}")
+        lines.append(f"    <i>{e(chat)} • {date_str}</i>\n")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n\n<i>...обрізано</i>"
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        reply_markup=main_keyboard(),
+    )
