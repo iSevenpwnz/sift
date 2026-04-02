@@ -49,34 +49,26 @@ async def get_or_create_settings(user_id: int) -> UserSettings:
 
 async def get_known_chats(user_id: int) -> list[dict]:
     """Get unique chats from messages DB — real chats the user has."""
-    from src.app.db.models import Message
-    from sqlalchemy import distinct, func, text
+    from sqlalchemy import text
 
     async with async_session() as session:
-        # Use DISTINCT ON to get one row per chat
         result = await session.execute(
-            select(
-                func.distinct(Message.source_chat).label("chat_name"),
-            )
-            .where(Message.source == "telegram")
-            .where(Message.source_chat.is_not(None))
-            .where(Message.source_chat != "Unknown")
+            text("""
+                SELECT DISTINCT ON (source_chat) source_chat, raw_metadata
+                FROM messages
+                WHERE source = 'telegram'
+                  AND source_chat IS NOT NULL
+                  AND source_chat != 'Unknown'
+                ORDER BY source_chat, created_at DESC
+            """)
         )
-        chat_names = [row[0] for row in result.all()]
+        chats = [
+            {"id": str(row[1].get("chat_id", "")), "name": row[0]}
+            for row in result.all()
+            if row[1] and "chat_id" in row[1]
+        ]
 
-        # Get chat_id for each chat name from raw_metadata
-        chats = []
-        for name in sorted(chat_names):
-            row = await session.execute(
-                select(Message.raw_metadata)
-                .where(Message.source_chat == name)
-                .limit(1)
-            )
-            meta = row.scalar_one_or_none()
-            if meta and "chat_id" in meta:
-                chats.append({"id": str(meta["chat_id"]), "name": name})
-
-    return chats
+    return sorted(chats, key=lambda c: c["name"])
 
 
 # ── Keyboard builders ───────────────────────────────────────
@@ -129,7 +121,7 @@ def quiet_keyboard(quiet_hours: dict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if enabled:
         builder.button(text=f"🌙 {start} — {end}", callback_data="noop")
-        builder.button(text="❌ Вимкнути тихі години", callback_data="qh:off")
+        builder.button(text="❌ Вимкнути", callback_data="qh:off", style="danger")
     else:
         builder.button(text="Тихі години вимкнені", callback_data="noop")
 

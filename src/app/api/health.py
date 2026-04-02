@@ -20,7 +20,7 @@ async def health() -> dict:
         last_message = result.scalar_one_or_none()
 
         result = await session.execute(
-            select(func.count()).where(Message.status.in_(["raw", "pending_ai"]))
+            select(func.count()).select_from(Message).where(Message.status.in_(["raw", "pending_ai"]))
         )
         pending = result.scalar_one()
 

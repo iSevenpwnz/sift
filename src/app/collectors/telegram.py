@@ -50,8 +50,8 @@ async def _load_chat_decisions() -> dict[str, str]:
 
 def _approval_keyboard(chat_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔔 Моніторити", callback_data=f"approve:{chat_id}"),
-        InlineKeyboardButton(text="🔇 Ігнорувати", callback_data=f"reject:{chat_id}"),
+        InlineKeyboardButton(text="🔔 Моніторити", callback_data=f"approve:{chat_id}", style="success"),
+        InlineKeyboardButton(text="🔇 Ігнорувати", callback_data=f"reject:{chat_id}", style="danger"),
     ]])
 
 

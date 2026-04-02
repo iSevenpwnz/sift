@@ -20,8 +20,20 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 def task_keyboard(task_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Done", callback_data=f"task_done:{task_id}"),
-            InlineKeyboardButton(text="⏰ 1h", callback_data=f"task_snooze:{task_id}:1"),
-            InlineKeyboardButton(text="📆 1d", callback_data=f"task_snooze:{task_id}:24"),
+            InlineKeyboardButton(
+                text="✅ Готово",
+                callback_data=f"task_done:{task_id}",
+                style="success",
+            ),
+            InlineKeyboardButton(
+                text="⏰ 1г",
+                callback_data=f"task_snooze:{task_id}:1",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                text="📆 1д",
+                callback_data=f"task_snooze:{task_id}:24",
+                style="primary",
+            ),
         ]
     ])

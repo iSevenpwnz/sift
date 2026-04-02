@@ -19,9 +19,11 @@ async def approve_chat(callback: CallbackQuery) -> None:
     await _set_chat_decision(chat_id, "monitored")
 
     # Clear pending cache so collector starts processing
-    from src.app.collectors.telegram import _pending_approval, _chat_decisions, _chat_decisions_loaded_at
+    from src.app.collectors.telegram import _pending_approval, _chat_decisions
+    import src.app.collectors.telegram as tg_mod
     _pending_approval.discard(chat_id)
     _chat_decisions[chat_id] = "monitored"
+    tg_mod._chat_decisions_loaded_at = 0
 
     await callback.answer("🔔 Моніторимо!")
     if callback.message:
@@ -35,8 +37,10 @@ async def reject_chat(callback: CallbackQuery) -> None:
     await _set_chat_decision(chat_id, "ignored")
 
     from src.app.collectors.telegram import _pending_approval, _chat_decisions
+    import src.app.collectors.telegram as tg_mod
     _pending_approval.discard(chat_id)
     _chat_decisions[chat_id] = "ignored"
+    tg_mod._chat_decisions_loaded_at = 0
 
     await callback.answer("🔇 Ігноруємо!")
     if callback.message:
@@ -81,13 +85,13 @@ async def task_done(callback: CallbackQuery) -> None:
             task.is_done = True
             task.done_at = datetime.now(timezone.utc)
             await session.commit()
-            await callback.answer("Done!")
+            await callback.answer("✅ Готово!")
             if callback.message:
                 await callback.message.edit_text(
-                    f"✅ <s>{task.title}</s> — done", parse_mode="HTML", reply_markup=None
+                    f"✅ <s>{task.title}</s> — виконано", parse_mode="HTML", reply_markup=None
                 )
         else:
-            await callback.answer("Task not found")
+            await callback.answer("Таск не знайдено")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("task_snooze:"))

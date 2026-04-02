@@ -8,6 +8,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import delete, func, select
 
+from src.app.constants import CATEGORY_ICONS
 from src.app.db.models import Message, Task, UserSettings
 from src.app.db.session import async_session
 from src.app.config import settings
@@ -37,14 +38,6 @@ def _msg_link(msg) -> str | None:
         return f"https://t.me/c/{cid[4:]}/{message_id}"
     # DMs — no public link
     return None
-
-
-CATEGORY_ICONS = {
-    "meeting": "📅",
-    "task": "📋",
-    "deadline": "🔴",
-    "info": "💡",
-}
 
 
 async def _summarize_groups(groups: dict[str, list[Message]]) -> dict[str, str]:
@@ -174,6 +167,11 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
         )
         tasks = list(result.scalars().all())
 
+        result = await session.execute(
+            select(Task.message_id).where(Task.is_done.is_(True)).where(Task.message_id.is_not(None))
+        )
+        done_msg_ids = set(result.scalars().all())
+
     if not all_msgs and not tasks:
         date_str = target_date.strftime("%d.%m")
         result = (f"📊 Дайджест за {date_str}\n\nНічого важливого.", _digest_nav_keyboard(target_date))
@@ -217,14 +215,6 @@ async def build_digest(target_date: date) -> tuple[str | list[str], InlineKeyboa
         if len(name) <= max_len:
             return name
         return name[:max_len - 1] + "…"
-
-    # Pre-load done task message IDs to filter them out
-    done_msg_ids = set()
-    async with async_session() as session:
-        result = await session.execute(
-            select(Task.message_id).where(Task.is_done.is_(True)).where(Task.message_id.is_not(None))
-        )
-        done_msg_ids = set(result.scalars().all())
 
     def _render_chat(chat_name: str, msgs: list):
         count = len(msgs)

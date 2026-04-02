@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -61,10 +62,13 @@ class GeminiProvider:
     @retry(wait=wait_exponential(min=1, max=60), stop=stop_after_attempt(3))
     async def categorize(self, messages: list[dict]) -> list[dict]:
         user_content = json.dumps({"messages": messages}, ensure_ascii=False)
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=f"{_get_system_prompt()}\n\n{user_content}",
-            config={"response_mime_type": "application/json"},
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: self.client.models.generate_content(
+                model=self.model,
+                contents=f"{_get_system_prompt()}\n\n{user_content}",
+                config={"response_mime_type": "application/json"},
+            ),
         )
         text = response.text or "{}"
         parsed = json.loads(text)

@@ -4,17 +4,11 @@ from aiogram.types import BotCommand, BotCommandScopeDefault, Message
 from sqlalchemy import func, select
 
 from src.app.bot.keyboards import main_keyboard, task_keyboard
+from src.app.constants import CATEGORY_ICONS
 from src.app.db.models import Message as DbMessage, Task
 from src.app.db.session import async_session
 
 router = Router()
-
-CATEGORY_ICONS = {
-    "meeting": "📅",
-    "task": "📋",
-    "deadline": "🔴",
-    "info": "💡",
-}
 
 
 # ── Bot commands registration ───────────────────────────────

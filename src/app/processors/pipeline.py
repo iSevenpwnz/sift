@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.app.db.models import Message, Task
 from src.app.db.session import async_session
+from src.app.constants import CATEGORY_ICONS
 from src.app.processors.ai_provider import get_fallback_provider, get_primary_provider
 from src.app.processors.filter_l1 import should_process
 from src.app.bot.keyboards import task_keyboard
@@ -64,14 +65,6 @@ def _format_date(iso_str: str) -> str:
         return iso_str
 
 
-CATEGORY_ICONS = {
-    "meeting": "📅",
-    "task": "📋",
-    "deadline": "🔴",
-    "info": "💡",
-}
-
-
 @dataclass
 class NotificationItem:
     msg: Message
@@ -114,7 +107,6 @@ async def persist_raw(message_data: dict) -> int | None:
 async def claim_raw_messages(limit: int = BATCH_SIZE) -> list[Message]:
     """Atomically claim raw messages for processing. Returns claimed messages."""
     async with async_session() as session:
-        # Subquery to get IDs, then update atomically
         subq = (
             select(Message.id)
             .where(Message.status == "raw")
@@ -122,16 +114,16 @@ async def claim_raw_messages(limit: int = BATCH_SIZE) -> list[Message]:
             .limit(limit)
             .with_for_update(skip_locked=True)
         )
-        result = await session.execute(select(Message).where(Message.id.in_(subq)))
-        messages = list(result.scalars().all())
-
-        if not messages:
-            return []
-
-        ids = [m.id for m in messages]
         await session.execute(
-            update(Message).where(Message.id.in_(ids)).values(status="processing")
+            update(Message).where(Message.id.in_(subq)).values(status="processing")
         )
+        result = await session.execute(
+            select(Message)
+            .where(Message.status == "processing")
+            .order_by(Message.created_at.asc())
+            .limit(limit)
+        )
+        messages = list(result.scalars().all())
         await session.commit()
         return messages
 
@@ -189,20 +181,24 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
                 await session.commit()
             return
 
-    # Save results + create tasks + collect notifications
     result_map = {r.get("id"): r for r in results if "id" in r}
     notification_buffer: list[NotificationItem] = []
 
-    for msg in to_ai:
-        ai_result = result_map.get(msg.id, {})
-        if not ai_result:
-            continue
+    async with async_session() as session:
+        msg_ids = [m.id for m in to_ai if m.id in result_map]
+        result = await session.execute(
+            select(Message).where(Message.id.in_(msg_ids))
+        )
+        msg_objs = {m.id: m for m in result.scalars().all()}
 
-        # Save AI result
-        async with async_session() as session:
-            msg_obj = await session.get(Message, msg.id)
+        for msg in to_ai:
+            ai_result = result_map.get(msg.id, {})
+            if not ai_result:
+                continue
+
+            msg_obj = msg_objs.get(msg.id)
             if not msg_obj or msg_obj.status in ("processed", "notified"):
-                continue  # Already done by another worker
+                continue
 
             msg_obj.category = ai_result.get("category")
             msg_obj.priority = ai_result.get("priority")
@@ -213,7 +209,13 @@ async def process_messages(messages: list[Message], bot: Bot | None = None) -> N
 
             if ai_result.get("date"):
                 msg_obj.extracted_date = _parse_ai_date(ai_result["date"])
-            await session.commit()
+
+        await session.commit()
+
+    for msg in to_ai:
+        ai_result = result_map.get(msg.id, {})
+        if not ai_result:
+            continue
 
         task = await _create_task(msg, ai_result)
 
@@ -382,8 +384,8 @@ async def _flush_notifications(bot: Bot, buffer: list[NotificationItem]) -> None
                 for ti in task_items:
                     short = ti.topic[:20] + ("..." if len(ti.topic) > 20 else "")
                     buttons.append([
-                        InlineKeyboardButton(text=f"✅ {short}", callback_data=f"task_done:{ti.task.id}"),
-                        InlineKeyboardButton(text="⏰ 1h", callback_data=f"task_snooze:{ti.task.id}:1"),
+                        InlineKeyboardButton(text=f"✅ {short}", callback_data=f"task_done:{ti.task.id}", style="success"),
+                        InlineKeyboardButton(text="⏰ 1г", callback_data=f"task_snooze:{ti.task.id}:1", style="primary"),
                     ])
                 reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
             else:
